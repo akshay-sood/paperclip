@@ -27,28 +27,40 @@ fn bounded(value: &Value, limit: usize) -> Result<(), DurableRunnerError> {
     Ok(())
 }
 
-fn event_schema(event_type: &str, value: &Value) -> Result<(), DurableRunnerError> {
-    static SCHEMA: OnceLock<Value> = OnceLock::new();
-    let schema = SCHEMA.get_or_init(|| {
-        serde_json::from_str(include_str!(
-            "../../../../protocol/schemas/event-v3.schema.json"
-        ))
-        .expect("bundled external event schema")
-    });
-    let payload = schema["allOf"]
-        .as_array()
-        .and_then(|clauses| {
-            clauses.iter().find(|clause| {
-                clause
-                    .pointer("/if/properties/eventType/const")
-                    .and_then(Value::as_str)
-                    == Some(event_type)
-            })
+fn event_validator(event_type: &str) -> Result<&'static jsonschema::Validator, DurableRunnerError> {
+    static DISPATCH: OnceLock<Result<jsonschema::Validator, &'static str>> = OnceLock::new();
+    static SETTLED: OnceLock<Result<jsonschema::Validator, &'static str>> = OnceLock::new();
+    let cache = match event_type {
+        "external_provider.dispatch_requested" => &DISPATCH,
+        "external_provider.operation_settled" => &SETTLED,
+        _ => return Err(invalid("external event schema is unavailable")),
+    };
+    cache
+        .get_or_init(|| {
+            let schema: Value = serde_json::from_str(include_str!(
+                "../../../../protocol/schemas/event-v3.schema.json"
+            ))
+            .map_err(|_| "external event schema is invalid")?;
+            let payload = schema["allOf"]
+                .as_array()
+                .and_then(|clauses| {
+                    clauses.iter().find(|clause| {
+                        clause
+                            .pointer("/if/properties/eventType/const")
+                            .and_then(Value::as_str)
+                            == Some(event_type)
+                    })
+                })
+                .and_then(|clause| clause.pointer("/then/properties/payload"))
+                .ok_or("external event schema is unavailable")?;
+            jsonschema::validator_for(payload).map_err(|_| "external event schema is invalid")
         })
-        .and_then(|clause| clause.pointer("/then/properties/payload"))
-        .ok_or_else(|| invalid("external event schema is unavailable"))?;
-    let validator = jsonschema::validator_for(payload)
-        .map_err(|_| invalid("external event schema is invalid"))?;
+        .as_ref()
+        .map_err(|message| invalid(message))
+}
+
+fn event_schema(event_type: &str, value: &Value) -> Result<(), DurableRunnerError> {
+    let validator = event_validator(event_type)?;
     if !validator.is_valid(value) {
         return Err(invalid("external event does not match its closed contract"));
     }
@@ -208,6 +220,27 @@ mod tests {
     use super::*;
     use serde_json::json;
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn external_event_validators_are_reused_across_threads_and_reject_unknown_types() {
+        let dispatch = event_validator("external_provider.dispatch_requested").unwrap();
+        let settled = event_validator("external_provider.operation_settled").unwrap();
+        assert!(!std::ptr::eq(dispatch, settled));
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for (event_type, expected) in [
+                        ("external_provider.dispatch_requested", dispatch),
+                        ("external_provider.operation_settled", settled),
+                    ] {
+                        assert!(std::ptr::eq(event_validator(event_type).unwrap(), expected));
+                        assert!(event_schema(event_type, &json!({})).is_err());
+                    }
+                });
+            }
+        });
+        assert!(event_validator("external_provider.unknown").is_err());
+    }
 
     pub(super) fn page(bytes: &[u8], offset: usize, total: &[u8]) -> Value {
         let end = offset + bytes.len();
