@@ -243,7 +243,7 @@ describe("external Runner failure diagnostics", () => {
   });
 });
 
-it("delivers complete dispatch and exact attachment pages through authenticated Rust PRP", async () => {
+it.each([false, true])("delivers complete dispatch and exact attachment pages through authenticated Rust PRP (startup failure=%s)", async startupFailure => {
   const root = await mkdtemp(join(tmpdir(), "dot-lossless-transport-"));
   const instructions = "Follow these synthetic instructions. ".repeat(300);
   await writeFile(join(root, "AGENTS.md"), instructions);
@@ -259,6 +259,7 @@ it("delivers complete dispatch and exact attachment pages through authenticated 
   const identity = { runnerInstanceId: randomUUID(), environmentLeaseId: randomUUID(), runId: input.binding.runId,
     normalizedSessionId: input.session.normalizedSessionId!, turnId: "turn-" + input.binding.runId, itemId: "item-" + input.binding.runId };
   let handle: controlPlane.RunnerProcessHandle | undefined;
+  let authority: controlPlane.DurablePrpControlPlane | undefined;
   const spawn = controlPlane.spawnRunner;
   const spawnSpy = vi.spyOn(controlPlane, "spawnRunner").mockImplementation(options => {
     handle = spawn(options);
@@ -266,6 +267,15 @@ it("delivers complete dispatch and exact attachment pages through authenticated 
   });
   const driver = new RunnerdDotDriver({
     execution: input, stateDirectory: join(root, "state"), identity,
+    controlPlaneRegistration: startupFailure ? async core => {
+      authority = core;
+      await core.start();
+      return { connectUrl: core.connectUrl, release: () => core.stop() };
+    } : undefined,
+    onSpawn: startupFailure ? async () => {
+      await vi.waitFor(() => expect(authority?.activeRunnerConnectionCount()).toBeGreaterThan(0), { timeout: 5_000 });
+      throw new Error("synthetic startup failure");
+    } : undefined,
     runnerBinary: resolve("runner/target/debug/paperclip-runnerd"),
     dynamicTools: [{ name: "read_task_attachment", description: "Read a synthetic verified attachment", inputSchema: { type: "object" } }],
     dynamicToolHandler: async call => {
@@ -286,6 +296,12 @@ it("delivers complete dispatch and exact attachment pages through authenticated 
     action, input: args, digest: externalOperationDigest(action, args),
   });
   try {
+    if (startupFailure) {
+      await expect(driver.openSession({ runId: input.binding.runId, normalizedSessionId: input.session.normalizedSessionId! }))
+        .rejects.toThrow("synthetic startup failure");
+      expect(handle).toBeDefined();
+      return;
+    }
     session = await driver.openSession({ runId: input.binding.runId, normalizedSessionId: input.session.normalizedSessionId! });
     const text = "Preamble é. ".repeat(1500) + "CURRENT MESSAGE: read the complete attachment.";
     await session.startTurn({ message: { role: "user", text } });
@@ -315,16 +331,13 @@ it("delivers complete dispatch and exact attachment pages through authenticated 
     expect(createHash("sha256").update(Buffer.concat(chunks)).digest("hex")).toBe(hash);
     expect(reads).toBe(6);
   } finally {
+    spawnSpy.mockRestore();
+    if (handle?.child.exitCode === null && handle.child.signalCode === null) handle.child.kill("SIGKILL");
     try {
-      await session?.interrupt!({ reason: "Synthetic test complete" });
-      await session?.close({ reason: "Synthetic test complete" });
-      await handle?.completion;
+      if (handle) await controlPlane.waitForProcess(handle, 5_000);
     } finally {
-      spawnSpy.mockRestore();
       await session?.detachControllerForRestart?.();
-      if (handle?.child.exitCode === null && handle.child.signalCode === null) handle.child.kill("SIGTERM");
-      await handle?.completion;
-      await rm(root, { recursive: true, force: true });
     }
+    await rm(root, { recursive: true, force: true });
   }
 }, 60000);
