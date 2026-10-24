@@ -8,7 +8,7 @@ import { verifiedRecordedIsolatedRemoteSource, withIsolatedRepositorySourceLock 
 import { expireReconstructableGitWorkspace, gitWorkspaceLastActivityAt, hasPendingGitExpiration, listIssuesUsingGitWorkspace } from "./git-workspace-expiration.js";
 import { expireIsolatedTaskDirectory, hasPendingTaskDirectoryRetention, isIsolatedTaskDirectoryWorkspace, isRetryableTaskDirectorySkip,
   mayBeIsolatedTaskDirectoryWorkspace, readTaskDirectoryRetention, restoreIsolatedTaskDirectory, supersedeTaskDirectoryRestorePoint,
-  sweepIsolatedTaskDirectories, taskDirectoryCandidateFilter, TASK_DIRECTORY_RESTORE_POINT_EXPIRED_WARNING, TASK_DIRECTORY_RETENTION_KEY,
+  sweepIsolatedTaskDirectories, inspectIsolatedTaskDirectoryFolders, taskDirectoryFoldersForHints, taskDirectoryCandidateFilter, TASK_DIRECTORY_RESTORE_POINT_EXPIRED_WARNING, TASK_DIRECTORY_RETENTION_KEY,
   TASK_DIRECTORY_RETRY_MS } from "./isolated-task-directory-retention.js";
 import { hasPendingIsolatedRepositoryRehomeCleanup, isIsolatedRepositoryRehomeCandidate, rehomeExpiredIsolatedRestoration, rehomeIsolatedRepositoryWorkspace, sweepOrphanedIsolatedRepositorySources } from "./isolated-repository-rehome.js";
 import { hasPendingNestedCloneMigration, isNestedCloneMigrationCandidate, nextNestedCloneMigrationBatch, pendingNestedCloneMigrationNames, listNestedCloneMigrationNames, migrateNestedRepositoryClone,
@@ -1772,9 +1772,70 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
   let isolatedOrphanCursor: string | null = null;
   let isolatedOrphanKept = false;
   const taskDirectoryDeadlines = new Map<string, number>();
-  let taskDirectoryFolderSweepDueAt = 0;
-  let taskDirectoryFolderCursor: string | null = null;
-  let taskDirectoryFolderRetryAt: number | null = null;
+  let taskDirectoryWalkDueAt = 0;
+  let taskDirectoryWalkCursor: string | null = null;
+  let taskDirectoryWalkRetryAt: number | null = null;
+  const taskDirectoryFolderDue = new Map<string, number>();
+  const taskDirectoryHints = new Set<string>();
+  const taskDirectoryRowSkips = new Map<string, { updatedAt: number; retryAt: number | null; issueId: string | null }>();
+  const TASK_DIRECTORY_FOLDERS_PER_SWEEP = 8;
+  const TASK_DIRECTORY_HINTS_PER_SWEEP = 64;
+  const remember = <K, V>(map: Map<K, V>, key: K, value: V) => {
+    if (!map.has(key) && map.size >= 4096) map.delete(map.keys().next().value!);
+    map.set(key, value);
+  };
+  async function runTaskDirectoryFolderWork(signal?: AbortSignal) {
+    const settings = opts.taskDirectoryRetention!;
+    const options = { dryRun: settings.dryRun, now: now(), orphanGraceMs: settings.orphanGraceMs, terminalDelayMs: settings.terminalDelayMs,
+      signal, beforeDelete: opts.beforeTerminalWorkspaceCleanup,
+      restorePoint: opts.gitRestorePoints ? { storage: opts.gitRestorePoints.storage, keyDurable: opts.gitRestorePoints.keyDurable } : undefined };
+    const nowMs = options.now.getTime();
+    let results: Awaited<ReturnType<typeof inspectIsolatedTaskDirectoryFolders>> = [];
+    try {
+      if (taskDirectoryWalkDueAt <= nowMs) {
+        const batch = await sweepIsolatedTaskDirectories(db, { ...options, after: taskDirectoryWalkCursor, limit: TASK_DIRECTORY_FOLDERS_PER_SWEEP });
+        results = batch.results;
+        if (batch.retryAt !== null) taskDirectoryWalkRetryAt = Math.min(taskDirectoryWalkRetryAt ?? Infinity, batch.retryAt);
+        taskDirectoryWalkCursor = batch.next;
+        if (taskDirectoryWalkCursor) taskDirectoryWalkDueAt = nowMs;
+        else {
+          taskDirectoryWalkDueAt = taskDirectoryWalkRetryAt ?? Number.POSITIVE_INFINITY;
+          taskDirectoryWalkRetryAt = null;
+        }
+      } else {
+        const hints = [...taskDirectoryHints].slice(0, TASK_DIRECTORY_HINTS_PER_SWEEP);
+        for (const hint of hints) taskDirectoryHints.delete(hint);
+        const hinted = hints.length === 0 ? [] : await taskDirectoryFoldersForHints(db, {
+          workspaceIds: hints.filter(hint => hint.startsWith("workspace:")).map(hint => hint.slice("workspace:".length)),
+          issueIds: hints.filter(hint => hint.startsWith("issue:")).map(hint => hint.slice("issue:".length)),
+        });
+        const folders = new Map(hinted.map(folder => [`${folder.companyId}/${folder.issueId}`, folder]));
+        for (const [key, dueAt] of taskDirectoryFolderDue) {
+          if (dueAt > nowMs) continue;
+          const [companyId, issueId] = key.split("/");
+          folders.set(key, { companyId: companyId!, issueId: issueId! });
+        }
+        const batch = [...folders.entries()].slice(0, TASK_DIRECTORY_FOLDERS_PER_SWEEP);
+        for (const [key] of batch) taskDirectoryFolderDue.delete(key);
+        for (const [key] of [...folders.entries()].slice(TASK_DIRECTORY_FOLDERS_PER_SWEEP)) remember(taskDirectoryFolderDue, key, nowMs);
+        results = await inspectIsolatedTaskDirectoryFolders(db, batch.map(([, folder]) => folder), options);
+      }
+    } catch (error) {
+      signal?.throwIfAborted();
+      logger.warn({ err: error }, "isolated task directory sweep failed; it retries later");
+      taskDirectoryWalkDueAt = Math.min(taskDirectoryWalkDueAt, nowMs + TASK_DIRECTORY_RETRY_MS);
+    }
+    for (const folder of results) {
+      const key = `${folder.companyId}/${folder.issueId}`;
+      if (folder.retryAt !== undefined) remember(taskDirectoryFolderDue, key, folder.retryAt);
+      else taskDirectoryFolderDue.delete(key);
+      logger.info({ event: "execution_workspace.task_directory_cleanup", dryRun: settings.dryRun, ...folder }, "Isolated task directory inspected");
+    }
+    taskDirectoryDeadlines.clear();
+    if (Number.isFinite(taskDirectoryWalkDueAt)) taskDirectoryDeadlines.set("walk", taskDirectoryWalkDueAt);
+    if (taskDirectoryHints.size > 0) taskDirectoryDeadlines.set("hints", now().getTime());
+    if (taskDirectoryFolderDue.size > 0) taskDirectoryDeadlines.set("folders", Math.min(...taskDirectoryFolderDue.values()));
+  }
   let terminalSweepRescanRequested = false;
   // The reaper freezes an upper bound on updatedAt at the start of each
   // rotation. The scan only reads candidates at or below the bound, so a steady
@@ -3273,6 +3334,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       terminalSweepInProgress = true;
       try {
       if (options.compact !== false) await purgeDeferredCompactionTrash(signal);
+      if (opts.taskDirectoryRetention) await runTaskDirectoryFolderWork(signal);
       const baseCandidateFilter = and(
         sql<boolean>`${executionWorkspaces.sourceIssueId} IS NOT NULL`,
         or(and(inArray(executionWorkspaces.status, ["active", "idle", "in_review"]), isNull(executionWorkspaces.closedAt)),
@@ -3302,33 +3364,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         terminalWorkspaceDeadlines.clear();
         isolatedRehomeDeadlines.clear();
         nestedCloneMigrationDeadlines.clear();
-        taskDirectoryDeadlines.clear();
         terminalSweepRescanRequested = false;
-        if (opts.taskDirectoryRetention && taskDirectoryFolderSweepDueAt <= now().getTime()) {
-          const settings = opts.taskDirectoryRetention;
-          const batch = await sweepIsolatedTaskDirectories(db, { dryRun: settings.dryRun, now: now(), orphanGraceMs: settings.orphanGraceMs,
-            terminalDelayMs: settings.terminalDelayMs, after: taskDirectoryFolderCursor, signal, beforeDelete: opts.beforeTerminalWorkspaceCleanup,
-            restorePoint: opts.gitRestorePoints ? { storage: opts.gitRestorePoints.storage, keyDurable: opts.gitRestorePoints.keyDurable } : undefined,
-          }).catch((error: unknown) => {
-            signal?.throwIfAborted();
-            logger.warn({ err: error }, "isolated task directory sweep failed; it retries later");
-            return null;
-          });
-          for (const folder of batch?.results ?? []) {
-            logger.info({ event: "execution_workspace.task_directory_cleanup", dryRun: settings.dryRun, ...folder }, "Isolated task directory inspected");
-          }
-          const retryAt = batch ? batch.retryAt : now().getTime() + TASK_DIRECTORY_RETRY_MS;
-          if (retryAt !== null) taskDirectoryFolderRetryAt = taskDirectoryFolderRetryAt === null ? retryAt : Math.min(taskDirectoryFolderRetryAt, retryAt);
-          taskDirectoryFolderCursor = batch?.next ?? null;
-          if (taskDirectoryFolderCursor) taskDirectoryFolderSweepDueAt = now().getTime();
-          else {
-            taskDirectoryFolderSweepDueAt = taskDirectoryFolderRetryAt ?? Number.POSITIVE_INFINITY;
-            taskDirectoryFolderRetryAt = null;
-          }
-        }
-        if (opts.taskDirectoryRetention && Number.isFinite(taskDirectoryFolderSweepDueAt)) {
-          taskDirectoryDeadlines.set("task-directory-folders", taskDirectoryFolderSweepDueAt);
-        }
         if (opts.gitCacheExpirationEnabled && opts.isolatedSourceRehomeEnabled && isolatedOrphanSweepDueAt <= now().getTime()) {
           const dryRun = opts.isolatedSourceRehomeDryRun ?? false;
           const batch = await sweepOrphanedIsolatedRepositorySources(db, { dryRun, signal, after: isolatedOrphanCursor }).catch((error: unknown) => {
@@ -3399,6 +3435,11 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       let taskDirectoryBudget = opts.taskDirectoryRetention?.perSweep ?? 8;
       const expireTaskDirectory = async (workspace: ExecutionWorkspaceRow, notBefore: Date) => {
         const settings = opts.taskDirectoryRetention!;
+        const skipped = taskDirectoryRowSkips.get(workspace.id);
+        if (skipped && skipped.updatedAt === workspace.updatedAt.getTime() && (skipped.retryAt === null || skipped.retryAt > now().getTime())) {
+          if (skipped.retryAt !== null) terminalWorkspaceDeadlines.set(workspace.id, skipped.retryAt);
+          return;
+        }
         if (taskDirectoryBudget <= 0) {
           terminalWorkspaceDeadlines.set(workspace.id, now().getTime());
           return;
@@ -3409,9 +3450,11 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           restorePoint: opts.gitRestorePoints ? { storage: opts.gitRestorePoints.storage, keyDurable: opts.gitRestorePoints.keyDurable } : undefined });
         if (expiration.candidate) result.eligible += 1;
         if (expiration.expired) result.archived += 1;
-        if (!expiration.expired && isRetryableTaskDirectorySkip(expiration.skipReason)) {
-          terminalWorkspaceDeadlines.set(workspace.id, now().getTime() + TASK_DIRECTORY_RETRY_MS);
-        } else terminalWorkspaceDeadlines.delete(workspace.id);
+        const retryAt = !expiration.expired && isRetryableTaskDirectorySkip(expiration.skipReason) ? now().getTime() + TASK_DIRECTORY_RETRY_MS : null;
+        if (retryAt !== null) terminalWorkspaceDeadlines.set(workspace.id, retryAt);
+        else terminalWorkspaceDeadlines.delete(workspace.id);
+        if (expiration.expired) taskDirectoryRowSkips.delete(workspace.id);
+        else remember(taskDirectoryRowSkips, workspace.id, { updatedAt: workspace.updatedAt.getTime(), retryAt, issueId: workspace.sourceIssueId });
         logger.info({ event: "execution_workspace.task_directory_retention", executionWorkspaceId: workspace.id,
           companyId: workspace.companyId, sourceIssueId: workspace.sourceIssueId, dryRun: settings.dryRun,
           outcome: expiration.expired ? "removed" : settings.dryRun && expiration.candidate ? "dry_run" : "skipped", ...expiration },
@@ -3938,6 +3981,16 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     terminalWorkspaceWorkSettled: (hints?: ReadonlySet<string>) => {
       if (terminalSweepInProgress || terminalSweepCursor !== null) terminalSweepRescanRequested = true;
       pullRequestStateCache.clear();
+      if (opts.taskDirectoryRetention) {
+        if (!hints) taskDirectoryRowSkips.clear();
+        for (const hint of hints ?? []) {
+          if (!hint.startsWith("workspace:") && !hint.startsWith("issue:")) continue;
+          if (taskDirectoryHints.size < 4096) taskDirectoryHints.add(hint);
+          taskDirectoryDeadlines.set("hints", now().getTime());
+          if (hint.startsWith("workspace:")) taskDirectoryRowSkips.delete(hint.slice("workspace:".length));
+          else for (const [id, skip] of taskDirectoryRowSkips) if (`issue:${skip.issueId}` === hint) taskDirectoryRowSkips.delete(id);
+        }
+      }
       if (!hints) { terminalInspections.clear(); return; }
       for (const [id, inspection] of terminalInspections) {
         if (hints.has(`workspace:${id}`) || [...inspection.issueIds].some(issueId => hints.has(`issue:${issueId}`))) {

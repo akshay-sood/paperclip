@@ -352,6 +352,7 @@ export type TaskDirectoryFolderResult = {
   candidateBytes: number;
   reclaimedBytes: number;
   executionWorkspaceId?: string;
+  retryAt?: number;
   failure?: GitExpirationFailure;
 };
 
@@ -410,17 +411,116 @@ async function listDirectory(target: string) {
   return (await fs.readdir(target)).sort();
 }
 
-export async function sweepIsolatedTaskDirectories(db: Db, options: {
+type FolderSweepOptions = {
   dryRun: boolean;
   now: Date;
   orphanGraceMs: number;
   terminalDelayMs: number;
   restorePoint?: TaskDirectoryRestorePointOptions;
-  after?: string | null;
-  limit?: number;
   signal?: AbortSignal;
   beforeDelete?: (workspace: Workspace) => Promise<void>;
-}): Promise<{ results: TaskDirectoryFolderResult[]; next: string | null; retryAt: number | null }> {
+};
+
+const CONSUMER_SKIPS = new Set(["live_workspace", "retention_pending", "project_workspace", "live_runtime_service", "live_run",
+  "unsettled_finalization", "live_lease", "recovery_action"]);
+
+async function inspectTaskDirectoryFolder(db: Db, companyId: string, name: string, options: FolderSweepOptions): Promise<TaskDirectoryFolderResult | null> {
+  const nowMs = options.now.getTime();
+  const root = await isolatedTaskDirectoriesRoot();
+  if (!root) return null;
+  const companyDir = path.join(root, companyId);
+  const folder = path.join(companyDir, name);
+  const result: TaskDirectoryFolderResult = { companyId, issueId: name, outcome: "skipped", reason: null, candidateBytes: 0, reclaimedBytes: 0 };
+  const retry = (at: number) => { result.retryAt = result.retryAt === undefined ? at : Math.min(result.retryAt, at); };
+  try {
+    if (!UUID.test(name) || !UUID.test(companyId)) throw new Error("unrecognized_task_directory_name");
+    const stat = await fs.lstat(folder).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    });
+    if (!stat) return null;
+    if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("unsafe_task_directory");
+    const rows = await folderRows(db, folder);
+    if (rows.some(row => !["archived", "cleanup_failed"].includes(row.status) || row.closedAt === null)) return null;
+    if (rows.some(row => hasPendingTaskDirectoryRetention(row))) throw new Error("retention_pending");
+    const [issue] = await db.select({ id: issues.id, executionWorkspaceId: issues.executionWorkspaceId }).from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.id, name)));
+    const tree = issue ? await issueTreeState(db, companyId, name) : { exists: false, open: false, closedAt: null };
+    if (tree.exists && (tree.open || !tree.closedAt)) throw new Error("issue_open");
+    const bound = issue ? rows.find(row => row.id === issue.executionWorkspaceId) : undefined;
+    if (bound) {
+      if (bound.cwd !== folder || !await isIsolatedTaskDirectoryWorkspace(bound)) throw new Error("bound_workspace");
+      result.executionWorkspaceId = bound.id;
+      const dueAt = tree.closedAt!.getTime() + options.terminalDelayMs;
+      if (dueAt > nowMs) { retry(dueAt); throw new Error("not_due"); }
+      const expiration = await expireIsolatedTaskDirectory(db, bound, { dryRun: options.dryRun, now: options.now,
+        notBefore: new Date(dueAt), restorePoint: options.restorePoint, signal: options.signal, beforeDelete: options.beforeDelete });
+      result.candidateBytes = expiration.candidateBytes;
+      result.reclaimedBytes = expiration.reclaimedBytes;
+      result.reason = expiration.skipReason;
+      if (expiration.failure) result.failure = expiration.failure;
+      result.outcome = expiration.expired ? "preserved_and_removed" : options.dryRun && expiration.candidate ? "dry_run" : "skipped";
+      if (isRetryableTaskDirectorySkip(expiration.skipReason)) retry(nowMs + TASK_DIRECTORY_RETRY_MS);
+      return result;
+    }
+    if (tree.exists && tree.closedAt!.getTime() + options.orphanGraceMs > nowMs) {
+      retry(tree.closedAt!.getTime() + options.orphanGraceMs);
+      throw new Error("grace_pending");
+    }
+    const newest = await newestTaskDirectoryMtime(folder, options.signal);
+    if (newest + options.orphanGraceMs > nowMs) {
+      retry(newest + options.orphanGraceMs);
+      throw new Error("recently_modified");
+    }
+    await withIsolatedRepositorySourceLock(db, companyId, name, async () => {
+      if (await directoryState(folder) !== "present") throw new Error("task_directory_changed");
+      const current = await folderRows(db, folder);
+      if (current.some(row => !["archived", "cleanup_failed"].includes(row.status) || row.closedAt === null)) throw new Error("live_workspace");
+      if (current.some(row => hasPendingTaskDirectoryRetention(row))) throw new Error("retention_pending");
+      const [currentIssue] = await db.select({ executionWorkspaceId: issues.executionWorkspaceId }).from(issues)
+        .where(and(eq(issues.companyId, companyId), eq(issues.id, name)));
+      if (Boolean(currentIssue) !== Boolean(issue) || (currentIssue && currentIssue.executionWorkspaceId !== issue!.executionWorkspaceId)) {
+        throw new Error("task_directory_changed");
+      }
+      const consumer = await orphanConsumer(db, companyId, name, folder);
+      if (consumer) throw new Error(consumer);
+      if (tree.exists) {
+        const latest = await issueTreeState(db, companyId, name);
+        if (latest.open || !latest.closedAt || latest.closedAt.getTime() + options.orphanGraceMs > nowMs) throw new Error("issue_open");
+      }
+      result.candidateBytes = await allocatedBytes(folder, () => { options.signal?.throwIfAborted(); return true; }).catch(() => 0);
+      if (options.dryRun) {
+        result.outcome = "dry_run";
+        return;
+      }
+      const trash = path.join(companyDir, `.expired-task-directory-orphan-${name}-${randomUUID()}`);
+      await fs.rename(folder, trash);
+      await removeTaskDirectoryTree(trash);
+      result.outcome = "removed";
+      result.reclaimedBytes = result.candidateBytes;
+    }, true);
+  } catch (error) {
+    options.signal?.throwIfAborted();
+    result.reason = skipReason(error);
+    if (result.reason === "inspection_failed") result.failure = describeGitExpirationFailure(error);
+    if (isRetryableTaskDirectorySkip(result.reason) || CONSUMER_SKIPS.has(result.reason)) retry(nowMs + TASK_DIRECTORY_RETRY_MS);
+  }
+  return result;
+}
+
+export async function inspectIsolatedTaskDirectoryFolders(db: Db, folders: Array<{ companyId: string; issueId: string }>, options: FolderSweepOptions) {
+  const results: TaskDirectoryFolderResult[] = [];
+  for (const folder of folders) {
+    options.signal?.throwIfAborted();
+    if (!IDENTITY.test(folder.companyId) || !IDENTITY.test(folder.issueId)) continue;
+    const result = await inspectTaskDirectoryFolder(db, folder.companyId, folder.issueId, options);
+    if (result) results.push(result);
+  }
+  return results;
+}
+
+export async function sweepIsolatedTaskDirectories(db: Db, options: FolderSweepOptions & { after?: string | null; limit?: number }):
+  Promise<{ results: TaskDirectoryFolderResult[]; next: string | null; retryAt: number | null }> {
   const results: TaskDirectoryFolderResult[] = [];
   const limit = options.limit ?? 8;
   const nowMs = options.now.getTime();
@@ -442,8 +542,8 @@ export async function sweepIsolatedTaskDirectories(db: Db, options: {
       if (inspected >= limit) return { results, next: lastPosition, retryAt };
       inspected += 1;
       lastPosition = `${companyId}/${name}`;
-      const folder = path.join(companyDir, name);
       if (TRASH.test(name)) {
+        const folder = path.join(companyDir, name);
         const stat = await fs.lstat(folder).catch(() => null);
         if (!stat || options.dryRun) continue;
         const touched = Math.max(stat.mtimeMs, stat.ctimeMs);
@@ -451,86 +551,34 @@ export async function sweepIsolatedTaskDirectories(db: Db, options: {
         await removeTaskDirectoryTree(folder).catch(() => retry(nowMs + TASK_DIRECTORY_RETRY_MS));
         continue;
       }
-      const result: TaskDirectoryFolderResult = { companyId, issueId: name, outcome: "skipped", reason: null, candidateBytes: 0, reclaimedBytes: 0 };
-      results.push(result);
-      try {
-        if (!UUID.test(name) || !UUID.test(companyId)) throw new Error("unrecognized_task_directory_name");
-        const stat = await fs.lstat(folder);
-        if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("unsafe_task_directory");
-        const rows = await folderRows(db, folder);
-        if (rows.some(row => !["archived", "cleanup_failed"].includes(row.status) || row.closedAt === null)) {
-          results.pop();
-          continue;
-        }
-        if (rows.some(row => hasPendingTaskDirectoryRetention(row))) throw new Error("retention_pending");
-        const [issue] = await db.select({ id: issues.id, executionWorkspaceId: issues.executionWorkspaceId }).from(issues)
-          .where(and(eq(issues.companyId, companyId), eq(issues.id, name)));
-        const tree = issue ? await issueTreeState(db, companyId, name) : { exists: false, open: false, closedAt: null };
-        if (tree.exists && (tree.open || !tree.closedAt)) {
-          retry(nowMs + TASK_DIRECTORY_RECHECK_MS);
-          throw new Error("issue_open");
-        }
-        const bound = issue ? rows.find(row => row.id === issue.executionWorkspaceId) : undefined;
-        if (bound) {
-          if (bound.cwd !== folder || !await isIsolatedTaskDirectoryWorkspace(bound)) throw new Error("bound_workspace");
-          result.executionWorkspaceId = bound.id;
-          const dueAt = tree.closedAt!.getTime() + options.terminalDelayMs;
-          if (dueAt > nowMs) { retry(dueAt); throw new Error("not_due"); }
-          const expiration = await expireIsolatedTaskDirectory(db, bound, { dryRun: options.dryRun, now: options.now,
-            notBefore: new Date(dueAt), restorePoint: options.restorePoint, signal: options.signal, beforeDelete: options.beforeDelete });
-          result.candidateBytes = expiration.candidateBytes;
-          result.reclaimedBytes = expiration.reclaimedBytes;
-          result.reason = expiration.skipReason;
-          if (expiration.failure) result.failure = expiration.failure;
-          result.outcome = expiration.expired ? "preserved_and_removed" : options.dryRun && expiration.candidate ? "dry_run" : "skipped";
-          if (isRetryableTaskDirectorySkip(expiration.skipReason)) retry(nowMs + TASK_DIRECTORY_RETRY_MS);
-          continue;
-        }
-        if (tree.exists && tree.closedAt!.getTime() + options.orphanGraceMs > nowMs) {
-          retry(tree.closedAt!.getTime() + options.orphanGraceMs);
-          throw new Error("grace_pending");
-        }
-        const newest = await newestTaskDirectoryMtime(folder, options.signal);
-        if (newest + options.orphanGraceMs > nowMs) {
-          retry(newest + options.orphanGraceMs);
-          throw new Error("recently_modified");
-        }
-        await withIsolatedRepositorySourceLock(db, companyId, name, async () => {
-          if (await directoryState(folder) !== "present") throw new Error("task_directory_changed");
-          const current = await folderRows(db, folder);
-          if (current.some(row => !["archived", "cleanup_failed"].includes(row.status) || row.closedAt === null)) throw new Error("live_workspace");
-          if (current.some(row => hasPendingTaskDirectoryRetention(row))) throw new Error("retention_pending");
-          const [currentIssue] = await db.select({ executionWorkspaceId: issues.executionWorkspaceId }).from(issues)
-            .where(and(eq(issues.companyId, companyId), eq(issues.id, name)));
-          if (Boolean(currentIssue) !== Boolean(issue) || (currentIssue && currentIssue.executionWorkspaceId !== issue!.executionWorkspaceId)) {
-            throw new Error("task_directory_changed");
-          }
-          const consumer = await orphanConsumer(db, companyId, name, folder);
-          if (consumer) throw new Error(consumer);
-          if (tree.exists) {
-            const latest = await issueTreeState(db, companyId, name);
-            if (latest.open || !latest.closedAt || latest.closedAt.getTime() + options.orphanGraceMs > nowMs) throw new Error("issue_open");
-          }
-          result.candidateBytes = await allocatedBytes(folder, () => { options.signal?.throwIfAborted(); return true; }).catch(() => 0);
-          if (options.dryRun) {
-            result.outcome = "dry_run";
-            return;
-          }
-          const trash = path.join(companyDir, `.expired-task-directory-orphan-${name}-${randomUUID()}`);
-          await fs.rename(folder, trash);
-          await removeTaskDirectoryTree(trash);
-          result.outcome = "removed";
-          result.reclaimedBytes = result.candidateBytes;
-        }, true);
-      } catch (error) {
-        options.signal?.throwIfAborted();
-        result.reason = skipReason(error);
-        if (result.reason === "inspection_failed") result.failure = describeGitExpirationFailure(error);
-        if (isRetryableTaskDirectorySkip(result.reason) || result.reason === "live_workspace") retry(nowMs + TASK_DIRECTORY_RETRY_MS);
-      }
+      const result = await inspectTaskDirectoryFolder(db, companyId, name, options);
+      if (result) results.push(result);
     }
   }
   return { results, next: null, retryAt };
+}
+
+export async function taskDirectoryFoldersForHints(db: Db, hints: { workspaceIds: string[]; issueIds: string[] }) {
+  const folders = new Map<string, { companyId: string; issueId: string }>();
+  const workspaceIds = hints.workspaceIds.filter(id => UUID.test(id));
+  const issueIds = hints.issueIds.filter(id => UUID.test(id));
+  if (workspaceIds.length > 0) {
+    const rows = await db.select({ companyId: executionWorkspaces.companyId, sourceIssueId: executionWorkspaces.sourceIssueId })
+      .from(executionWorkspaces).where(and(inArray(executionWorkspaces.id, workspaceIds),
+        inArray(executionWorkspaces.status, ["archived", "cleanup_failed"]), eq(executionWorkspaces.strategyType, "project_primary")));
+    for (const row of rows) if (row.sourceIssueId) folders.set(`${row.companyId}/${row.sourceIssueId}`, { companyId: row.companyId, issueId: row.sourceIssueId });
+  }
+  if (issueIds.length > 0) {
+    const rows = await db.select({ id: issues.id, companyId: issues.companyId }).from(issues)
+      .where(and(inArray(issues.id, issueIds), inArray(issues.status, ["done", "cancelled"])));
+    for (const row of rows) folders.set(`${row.companyId}/${row.id}`, { companyId: row.companyId, issueId: row.id });
+  }
+  const present: Array<{ companyId: string; issueId: string }> = [];
+  for (const folder of folders.values()) {
+    const target = await canonicalTaskDirectory(folder.companyId, folder.issueId);
+    if (target && await exists(target)) present.push(folder);
+  }
+  return present;
 }
 
 export function taskDirectoryCandidateFilter() {

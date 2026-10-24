@@ -2,6 +2,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { eq, sql } from "drizzle-orm";
 import {
@@ -299,6 +300,27 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
     expect((await f.row()).status).toBe("archived");
   });
 
+  it("saves and restores file names that contain a backslash", async () => {
+    const f = await fixture();
+    await fs.writeFile(path.join(f.cwd, "report\\final.txt"), "backslash name\n");
+    expect(await f.expire()).toMatchObject({ expired: true });
+    expect(await f.reopen()).toMatchObject({ ok: true, reopened: true });
+    expect(await fs.readFile(path.join(f.cwd, "report\\final.txt"), "utf8")).toBe("backslash name\n");
+  });
+
+  it("does not let skipped rows starve later rows of the per-sweep budget", async () => {
+    const blocked = await fixture();
+    execFileSync("mkfifo", [path.join(blocked.cwd, "pipe")]);
+    const ready = await fixture();
+    await db.update(executionWorkspaces).set({ updatedAt: new Date(Date.now() - 60_000) }).where(eq(executionWorkspaces.id, blocked.workspaceId));
+    const service = blocked.service({ taskDirectoryRetention: { ...settings, perSweep: 1 } });
+    expect(await service.sweepTerminalWorkspaces()).toMatchObject({ archived: 0 });
+    expect(await exists(ready.cwd)).toBe(true);
+    expect(await service.sweepTerminalWorkspaces()).toMatchObject({ archived: 1 });
+    expect(await exists(ready.cwd)).toBe(false);
+    expect(await exists(blocked.cwd)).toBe(true);
+  });
+
   describe("folder sweep", () => {
     const sweep = (overrides: Partial<Parameters<typeof sweepIsolatedTaskDirectories>[1]> = {}) => sweepIsolatedTaskDirectories(db, {
       dryRun: false, now: new Date(), orphanGraceMs: 7 * DAY_MS, terminalDelayMs: 3 * DAY_MS,
@@ -326,7 +348,7 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
       const o = await orphan({ modifiedDaysAgo: 2 });
       const batch = await sweep();
       expect(batch.results).toMatchObject([{ issueId: o.issueId, outcome: "skipped", reason: "recently_modified" }]);
-      expect(batch.retryAt).toBeGreaterThan(Date.now() + 4 * DAY_MS);
+      expect(batch.results[0]!.retryAt).toBeGreaterThan(Date.now() + 4 * DAY_MS);
       expect(await exists(o.cwd)).toBe(true);
     });
 
@@ -382,6 +404,34 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
       expect(await f.ledger()).toMatchObject([{ status: "active" }]);
       expect(await f.reopen()).toMatchObject({ ok: true, reopened: true });
       await expectRestored(f.cwd);
+    });
+
+    it("retries an orphan that a live run still uses", async () => {
+      const o = await orphan();
+      const agentId = randomUUID();
+      await db.insert(companies).values({ id: o.companyId, name: "Busy", issuePrefix: `BS${o.companyId.slice(0, 6)}` });
+      await db.insert(agents).values({ id: agentId, companyId: o.companyId, name: "Busy agent" });
+      await db.insert(issues).values({ id: o.issueId, companyId: o.companyId, title: "Old", status: "done", completedAt: new Date(Date.now() - 10 * DAY_MS) });
+      await db.insert(heartbeatRuns).values({ companyId: o.companyId, agentId, status: "running", contextSnapshot: { issueId: o.issueId } });
+      const batch = await sweep();
+      expect(batch.results).toMatchObject([{ outcome: "skipped", reason: "live_run" }]);
+      expect(batch.results[0]!.retryAt).toBeGreaterThan(Date.now());
+      expect(await exists(o.cwd)).toBe(true);
+    });
+
+    it("finds a folder left by a later archive through workspace change hints", async () => {
+      const service = executionWorkspaceService(db, { taskDirectoryRetention: settings, gitRestorePoints: restorePoints() });
+      await service.sweepTerminalWorkspaces();
+      expect(await service.nextTerminalWorkspaceSweepAt()).toBeNull();
+      const f = await fixture({ status: "archived" });
+      await service.sweepTerminalWorkspaces();
+      expect(await exists(f.cwd)).toBe(true);
+      service.terminalWorkspaceWorkSettled(new Set([`workspace:${f.workspaceId}`]));
+      expect(await service.nextTerminalWorkspaceSweepAt()).toBeLessThanOrEqual(Date.now());
+      await service.sweepTerminalWorkspaces();
+      expect(await exists(f.cwd)).toBe(false);
+      expect(readTaskDirectoryRetention(await f.row())).toMatchObject({ removed: true });
+      expect(await service.nextTerminalWorkspaceSweepAt()).toBeNull();
     });
 
     it("bounds the work per sweep and continues from its cursor", async () => {

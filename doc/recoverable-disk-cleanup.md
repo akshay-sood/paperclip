@@ -264,7 +264,9 @@ directory and every symbolic link (the link itself; links are never followed). A
 package recreates it. Sockets, devices and other special files keep the directory
 (`unsupported_filesystem_entry`), and so does a directory over the restore point limits
 (`task_directory_too_many_files`, `task_directory_file_too_large`,
-`task_directory_too_large`; 20,000 files, 64 MiB per file, 256 MiB in total). The restore
+`task_directory_too_large`; 20,000 files, 64 MiB per file, 256 MiB in total). The
+captured snapshot is decoded once before anything is removed; a directory whose snapshot
+could not be restored stays (`task_directory_not_restorable`). The restore
 point uses the git restore point ledger, storage and encryption: it is sealed with a
 per-restore-point key wrapped by the instance secrets key, uploaded to file storage under
 `git-restore-points/<workspace>/<generation>/task-directory/`, read back and hash-checked,
@@ -311,11 +313,14 @@ symbolic links. For each directory:
   orphan is not saved first: no workspace row can reopen it. If its issue is reopened
   later without another workspace, its next run starts in an empty directory.
 
-When the walk ends and it kept a directory for a reason that can change, it registers the
-earliest moment that reason expires (end of the grace period, or a recheck a day later for
-open issues and an hour later for busy locks). Otherwise it registers no further work. It
-also deletes leftover `.expired-task-directory-*` and `.restoring-task-directory-*`
-directories older than an hour.
+After that first walk, the reaper looks only at the directories that changes point to: a
+workspace row that becomes archived or `cleanup_failed`, or an issue that becomes `done` or
+`cancelled`, sends the reaper to that issue's directory. A directory it kept is checked
+again at its own deadline: the end of the grace period or terminal delay, or an hour later
+when a lock was busy or a live run, lease, service, finalization or recovery action still
+used it. A directory whose issue is open waits for the issue to close. With nothing pending
+it registers no work. The walk also deletes leftover `.expired-task-directory-*` and
+`.restoring-task-directory-*` directories older than an hour.
 
 ### Controls and logs
 
@@ -331,7 +336,9 @@ reclaimed bytes. Each directory the walk inspects logs
 `event: "execution_workspace.task_directory_cleanup"` with its outcome (`removed`,
 `preserved_and_removed`, `dry_run` or `skipped`), reason and bytes. Each reopen that
 restores a directory logs `event: "execution_workspace.task_directory_restore"`. A sweep
-saves and removes at most 8 open task directories; the rest continue in the next sweep.
+saves and removes at most 8 open task directories; the rest continue in the next sweep. A
+workspace that was skipped is inspected again only when it or its issue changes, or at its
+retry deadline, so skipped workspaces do not use up that limit.
 Roll out with the dry run, inspect the candidates and skip reasons, then set the dry run to
 `false`.
 

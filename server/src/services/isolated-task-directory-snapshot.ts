@@ -152,8 +152,11 @@ export async function captureTaskDirectorySnapshot(root: string, options: { limi
   const encoded = Buffer.from(JSON.stringify(manifest));
   const length = Buffer.alloc(4);
   length.writeUInt32BE(encoded.length);
+  const payload = Buffer.concat([PAYLOAD_MAGIC, length, encoded, ...bodies]);
+  try { decodeTaskDirectorySnapshot(payload); }
+  catch { throw new TaskDirectorySnapshotSkip("task_directory_not_restorable"); }
   return {
-    payload: Buffer.concat([PAYLOAD_MAGIC, length, encoded, ...bodies]),
+    payload,
     digest: taskDirectoryManifestDigest(manifest),
     files: walked.entries.filter(entry => entry.type === "file").length,
     excluded: walked.excluded.length,
@@ -161,7 +164,8 @@ export async function captureTaskDirectorySnapshot(root: string, options: { limi
 }
 
 function validRelativePath(value: unknown): value is string {
-  if (typeof value !== "string" || value.length === 0 || value.length > 4096 || value.includes("\0") || value.includes("\\")) return false;
+  if (typeof value !== "string" || value.length === 0 || value.length > 4096 || value.includes("\0")) return false;
+  if (path.sep !== "/" && value.includes(path.sep)) return false;
   if (value.startsWith("/")) return false;
   return value.split("/").every(part => part.length > 0 && part !== "." && part !== "..");
 }
