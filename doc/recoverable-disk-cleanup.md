@@ -309,13 +309,16 @@ symbolic links. For each directory:
   gone, or every issue in the tree has been closed for
   `PAPERCLIP_TASK_DIRECTORY_ORPHAN_GRACE_DAYS` (default `7`), and nothing in it changed
   during that period, and no project workspace, live runtime service, unsettled run,
-  finalization, live lease or unresolved recovery action of the issue refers to it. An
+  finalization, live lease or unresolved recovery action of the issue refers to it. Leases
+count when they belong to a run of the issue tree, to an issue in the tree, or to any
+workspace row of the directory. An
   orphan is not saved first: no workspace row can reopen it. If its issue is reopened
   later without another workspace, its next run starts in an empty directory.
 
 After that first walk, the reaper looks only at the directories that changes point to: a
 workspace row that becomes archived or `cleanup_failed`, or an issue that becomes `done` or
-`cancelled`, sends the reaper to that issue's directory. A directory it kept is checked
+`cancelled`, sends the reaper to that issue's directory and the directories of its
+ancestors, whose trees may have just closed. A directory it kept is checked
 again at its own deadline: the end of the grace period or terminal delay, or an hour later
 when a lock was busy or a live run, lease, service, finalization or recovery action still
 used it. A directory whose issue is open waits for the issue to close. With nothing pending

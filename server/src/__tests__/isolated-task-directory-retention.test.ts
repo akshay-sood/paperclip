@@ -448,6 +448,31 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
       for (const folder of folders) expect(await exists(folder.cwd)).toBe(false);
     });
 
+    it("returns to a parent's folder when its last open child closes", async () => {
+      const service = executionWorkspaceService(db, { taskDirectoryRetention: settings, gitRestorePoints: restorePoints() });
+      const f = await fixture({ status: "archived" });
+      const childId = randomUUID();
+      await db.insert(issues).values({ id: childId, companyId: f.companyId, parentId: f.issueId, title: "Open child", status: "todo" });
+      await service.sweepTerminalWorkspaces();
+      expect(await exists(f.cwd)).toBe(true);
+      await db.update(issues).set({ status: "done", completedAt: new Date(Date.now() - 4 * DAY_MS) }).where(eq(issues.id, childId));
+      service.terminalWorkspaceWorkSettled(new Set([`issue:${childId}`]));
+      await service.sweepTerminalWorkspaces();
+      expect(await exists(f.cwd)).toBe(false);
+      expect(readTaskDirectoryRetention(await f.row())).toMatchObject({ removed: true });
+    });
+
+    it("keeps an orphan whose closed workspace still has a lease cleanup pending", async () => {
+      const o = await orphan();
+      await db.insert(companies).values({ id: o.companyId, name: "Lease", issuePrefix: `LS${o.companyId.slice(0, 6)}` });
+      const [row] = await db.insert(executionWorkspaces).values({ companyId: o.companyId, mode: "shared_workspace", strategyType: "project_primary",
+        name: "Closed", status: "archived", closedAt: new Date(Date.now() - 10 * DAY_MS), providerType: "local_fs", cwd: o.cwd }).returning();
+      await db.insert(environmentLeases).values({ companyId: o.companyId, executionWorkspaceId: row!.id, status: "pending_cleanup",
+        releasedAt: new Date(Date.now() - 10 * DAY_MS) });
+      expect((await sweep()).results).toMatchObject([{ outcome: "skipped", reason: "live_lease" }]);
+      expect(await exists(o.cwd)).toBe(true);
+    });
+
     it("bounds the work per sweep and continues from its cursor", async () => {
       const folders = [await orphan(), await orphan(), await orphan()];
       const first = await sweep({ limit: 2 });

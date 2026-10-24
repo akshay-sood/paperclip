@@ -396,7 +396,9 @@ async function orphanConsumer(db: Db, companyId: string, issueId: string, folder
         AND (f.issue_id IN (SELECT id FROM tree) OR f.run_id IN (SELECT id FROM relevant_runs))
         AND (f.lease_owner IS NOT NULL OR f.phase NOT IN ('committed', 'terminal_failure'))) THEN 'unsettled_finalization'
       WHEN EXISTS (SELECT 1 FROM ${environmentLeases} l WHERE l.company_id = ${companyId}
-        AND l.heartbeat_run_id IN (SELECT id FROM relevant_runs)
+        AND (l.heartbeat_run_id IN (SELECT id FROM relevant_runs) OR l.issue_id IN (SELECT id FROM tree)
+          OR l.execution_workspace_id IN (SELECT w.id FROM ${executionWorkspaces} w WHERE w.cwd = ${folder} OR w.provider_ref = ${folder}
+            OR left(w.cwd, length(${folder}) + 1) = ${folder} || '/' OR left(w.provider_ref, length(${folder}) + 1) = ${folder} || '/'))
         AND (l.status = 'pending_cleanup' OR l.cleanup_status = 'failed' OR l.metadata ? 'nativeWorkspaceExportResume'
           OR (l.released_at IS NULL AND NOT coalesce(l.status = 'retained' AND l.lease_policy = 'reuse_by_environment' AND l.cleanup_status = 'success', false)))) THEN 'live_lease'
       WHEN EXISTS (SELECT 1 FROM ${issueRecoveryActions} WHERE company_id = ${companyId}
@@ -569,9 +571,16 @@ export async function taskDirectoryFoldersForHints(db: Db, hints: { workspaceIds
     for (const row of rows) if (row.sourceIssueId) folders.set(`${row.companyId}/${row.sourceIssueId}`, { companyId: row.companyId, issueId: row.sourceIssueId });
   }
   if (issueIds.length > 0) {
-    const rows = await db.select({ id: issues.id, companyId: issues.companyId }).from(issues)
-      .where(and(inArray(issues.id, issueIds), inArray(issues.status, ["done", "cancelled"])));
-    for (const row of rows) folders.set(`${row.companyId}/${row.id}`, { companyId: row.companyId, issueId: row.id });
+    const rows = await db.execute<{ id: string; company_id: string }>(sql`
+      WITH RECURSIVE closed_up AS (
+        SELECT id, parent_id, company_id, 0 AS depth FROM ${issues}
+        WHERE id IN (${sql.join(issueIds.map(id => sql`${id}::uuid`), sql`, `)}) AND status IN ('done', 'cancelled')
+        UNION
+        SELECT p.id, p.parent_id, p.company_id, c.depth + 1 FROM ${issues} p
+        JOIN closed_up c ON p.id = c.parent_id AND p.company_id = c.company_id WHERE c.depth < 64
+      )
+      SELECT DISTINCT id, company_id FROM closed_up`);
+    for (const row of rows) folders.set(`${row.company_id}/${row.id}`, { companyId: row.company_id, issueId: row.id });
   }
   const present: Array<{ companyId: string; issueId: string }> = [];
   for (const folder of folders.values()) {
