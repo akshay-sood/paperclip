@@ -434,6 +434,20 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
       expect(await service.nextTerminalWorkspaceSweepAt()).toBeNull();
     });
 
+    it("keeps overflowing folder deadlines discoverable through another walk", async () => {
+      const folders = [await orphan({ modifiedDaysAgo: 1 }), await orphan({ modifiedDaysAgo: 1 })];
+      let clock = Date.now();
+      const service = executionWorkspaceService(db, { taskDirectoryRetention: { ...settings, trackedLimit: 1 },
+        gitRestorePoints: restorePoints(), now: () => new Date(clock) });
+      await service.sweepTerminalWorkspaces();
+      for (const folder of folders) expect(await exists(folder.cwd)).toBe(true);
+      const deadline = await service.nextTerminalWorkspaceSweepAt();
+      expect(deadline).toBeGreaterThan(clock);
+      clock = deadline! + 1000;
+      await service.sweepTerminalWorkspaces();
+      for (const folder of folders) expect(await exists(folder.cwd)).toBe(false);
+    });
+
     it("bounds the work per sweep and continues from its cursor", async () => {
       const folders = [await orphan(), await orphan(), await orphan()];
       const first = await sweep({ limit: 2 });

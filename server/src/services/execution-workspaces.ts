@@ -319,7 +319,7 @@ export type ExecutionWorkspaceServiceOptions = {
   nestedCloneMigrationEnabled?: boolean;
   nestedCloneMigrationDryRun?: boolean;
   gitRestorePoints?: { storage: StorageService; terminalDelayMs: number; keyDurable: boolean; idleMs?: number | null };
-  taskDirectoryRetention?: { dryRun: boolean; terminalDelayMs: number; orphanGraceMs: number; perSweep?: number };
+  taskDirectoryRetention?: { dryRun: boolean; terminalDelayMs: number; orphanGraceMs: number; perSweep?: number; trackedLimit?: number };
   terminalWorkspaceInspectionBackoffMs?: number;
   resolvePullRequestDetails?: PullRequestMergeDetailsResolver;
   now?: () => Date;
@@ -1784,6 +1784,14 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     if (!map.has(key) && map.size >= 4096) map.delete(map.keys().next().value!);
     map.set(key, value);
   };
+  const TASK_DIRECTORY_TRACKED_LIMIT = opts.taskDirectoryRetention?.trackedLimit ?? 4096;
+  const rememberFolder = (key: string, dueAt: number) => {
+    if (!taskDirectoryFolderDue.has(key) && taskDirectoryFolderDue.size >= TASK_DIRECTORY_TRACKED_LIMIT) {
+      taskDirectoryWalkDueAt = Math.min(taskDirectoryWalkDueAt, dueAt);
+      return;
+    }
+    taskDirectoryFolderDue.set(key, dueAt);
+  };
   async function runTaskDirectoryFolderWork(signal?: AbortSignal) {
     const settings = opts.taskDirectoryRetention!;
     const options = { dryRun: settings.dryRun, now: now(), orphanGraceMs: settings.orphanGraceMs, terminalDelayMs: settings.terminalDelayMs,
@@ -1817,7 +1825,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         }
         const batch = [...folders.entries()].slice(0, TASK_DIRECTORY_FOLDERS_PER_SWEEP);
         for (const [key] of batch) taskDirectoryFolderDue.delete(key);
-        for (const [key] of [...folders.entries()].slice(TASK_DIRECTORY_FOLDERS_PER_SWEEP)) remember(taskDirectoryFolderDue, key, nowMs);
+        for (const [key] of [...folders.entries()].slice(TASK_DIRECTORY_FOLDERS_PER_SWEEP)) rememberFolder(key, nowMs);
         results = await inspectIsolatedTaskDirectoryFolders(db, batch.map(([, folder]) => folder), options);
       }
     } catch (error) {
@@ -1827,7 +1835,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     }
     for (const folder of results) {
       const key = `${folder.companyId}/${folder.issueId}`;
-      if (folder.retryAt !== undefined) remember(taskDirectoryFolderDue, key, folder.retryAt);
+      if (folder.retryAt !== undefined) rememberFolder(key, folder.retryAt);
       else taskDirectoryFolderDue.delete(key);
       logger.info({ event: "execution_workspace.task_directory_cleanup", dryRun: settings.dryRun, ...folder }, "Isolated task directory inspected");
     }
@@ -3985,7 +3993,8 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         if (!hints) taskDirectoryRowSkips.clear();
         for (const hint of hints ?? []) {
           if (!hint.startsWith("workspace:") && !hint.startsWith("issue:")) continue;
-          if (taskDirectoryHints.size < 4096) taskDirectoryHints.add(hint);
+          if (taskDirectoryHints.size < TASK_DIRECTORY_TRACKED_LIMIT) taskDirectoryHints.add(hint);
+          else taskDirectoryWalkDueAt = Math.min(taskDirectoryWalkDueAt, now().getTime());
           taskDirectoryDeadlines.set("hints", now().getTime());
           if (hint.startsWith("workspace:")) taskDirectoryRowSkips.delete(hint.slice("workspace:".length));
           else for (const [id, skip] of taskDirectoryRowSkips) if (`issue:${skip.issueId}` === hint) taskDirectoryRowSkips.delete(id);
