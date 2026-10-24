@@ -258,6 +258,12 @@ it("delivers complete dispatch and exact attachment pages through authenticated 
   const dispatches: any[] = [];
   const identity = { runnerInstanceId: randomUUID(), environmentLeaseId: randomUUID(), runId: input.binding.runId,
     normalizedSessionId: input.session.normalizedSessionId!, turnId: "turn-" + input.binding.runId, itemId: "item-" + input.binding.runId };
+  let handle: controlPlane.RunnerProcessHandle | undefined;
+  const spawn = controlPlane.spawnRunner;
+  const spawnSpy = vi.spyOn(controlPlane, "spawnRunner").mockImplementation(options => {
+    handle = spawn(options);
+    return handle;
+  });
   const driver = new RunnerdDotDriver({
     execution: input, stateDirectory: join(root, "state"), identity,
     runnerBinary: resolve("runner/target/debug/paperclip-runnerd"),
@@ -273,13 +279,14 @@ it("delivers complete dispatch and exact attachment pages through authenticated 
     port: { dispatch: async event => { dispatches.push(event); }, settle: async event => { settlements.set(String(event.payload.requestId), event.payload.outcome); },
       attach: async callback => { send = callback; return async () => { send = undefined; }; } },
   });
-  const session = await driver.openSession({ runId: input.binding.runId, normalizedSessionId: input.session.normalizedSessionId! });
+  let session: Awaited<ReturnType<typeof driver.openSession>> | undefined;
   const operation = (action: ExternalProviderOperation["action"], args: Record<string, unknown>): ExternalProviderOperation => ({
     requestId: randomUUID(), bindingId: input.provider.binding.bindingId, bindingGeneration: 1, runId: input.binding.runId,
     normalizedSessionId: input.session.normalizedSessionId!, turnId: identity.turnId, assignmentRevision: 1,
     action, input: args, digest: externalOperationDigest(action, args),
   });
   try {
+    session = await driver.openSession({ runId: input.binding.runId, normalizedSessionId: input.session.normalizedSessionId! });
     const text = "Preamble é. ".repeat(1500) + "CURRENT MESSAGE: read the complete attachment.";
     await session.startTurn({ message: { role: "user", text } });
     await vi.waitFor(() => expect(dispatches).toHaveLength(1));
@@ -308,8 +315,16 @@ it("delivers complete dispatch and exact attachment pages through authenticated 
     expect(createHash("sha256").update(Buffer.concat(chunks)).digest("hex")).toBe(hash);
     expect(reads).toBe(6);
   } finally {
-    await session.interrupt!({ reason: "Synthetic test complete" });
-    await session.close({ reason: "Synthetic test complete" });
-    await rm(root, { recursive: true, force: true });
+    try {
+      await session?.interrupt!({ reason: "Synthetic test complete" });
+      await session?.close({ reason: "Synthetic test complete" });
+      await handle?.completion;
+    } finally {
+      spawnSpy.mockRestore();
+      await session?.detachControllerForRestart?.();
+      if (handle?.child.exitCode === null && handle.child.signalCode === null) handle.child.kill("SIGTERM");
+      await handle?.completion;
+      await rm(root, { recursive: true, force: true });
+    }
   }
 }, 60000);
