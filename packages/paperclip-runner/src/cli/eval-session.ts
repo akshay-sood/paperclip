@@ -23,6 +23,7 @@ import {
   CapabilityLiveSessionService,
   type CapabilityLiveSession,
   type CapabilityLiveSessionSnapshot,
+  type CapabilityLiveSessionServiceOptions,
   type CapabilityLiveTurnResult,
   type CreateCapabilityLiveSessionInput,
 } from "../live/live-session.js";
@@ -35,6 +36,7 @@ import {
   type EvalSessionUsage,
 } from "./eval-session-contract.js";
 import { evalProviderTransportOptions } from "./eval-provider-runtime.js";
+import { prepareEvalGatewayRuntime } from "./eval-gateway-runtime.js";
 import { NativeSessionCloseUnrecoverableError } from "../contracts/native-session-backend.js";
 
 interface EvalSessionCliOptions {
@@ -42,6 +44,7 @@ interface EvalSessionCliOptions {
   outputPath: string;
   candidateProfile?: EvalCandidateProfile;
   expectedAcpxProfile?: Record<string, unknown>;
+  gatewayConfigPath?: string;
 }
 
 function argument(args: string[], name: string): string {
@@ -52,7 +55,7 @@ function argument(args: string[], name: string): string {
 }
 
 export function parseEvalSessionCliArgs(args: string[]): EvalSessionCliOptions {
-  const allowed = new Set(["--request", "--output", "--candidate-profile", "--expected-acpx-profile"]);
+  const allowed = new Set(["--request", "--output", "--candidate-profile", "--expected-acpx-profile", "--gateway-config"]);
   const seen = new Set<string>();
   for (let index = 0; index < args.length; index += 2) {
     if (!allowed.has(args[index] ?? "")) {
@@ -89,6 +92,7 @@ export function parseEvalSessionCliArgs(args: string[]): EvalSessionCliOptions {
   return {
     ...(candidateProfile === undefined ? {} : { candidateProfile }),
     ...(expectedAcpxProfile === undefined ? {} : { expectedAcpxProfile }),
+    ...(seen.has("--gateway-config") ? { gatewayConfigPath: argument(args, "--gateway-config") } : {}),
     requestPath: argument(args, "--request"),
     outputPath: argument(args, "--output"),
   };
@@ -362,6 +366,7 @@ export async function runEvalSessionCli(
   options: {
     serviceFactory?: (
       runnerBinary: string,
+      transportOptions: NonNullable<CapabilityLiveSessionServiceOptions["transportOptions"]>,
     ) => CapabilityLiveSessionService;
   } = {},
 ): Promise<number> {
@@ -398,32 +403,31 @@ export async function runEvalSessionCli(
   const requestedDriver = request.driver ??
     expectedEvalSessionDriver(requestedProvider);
   const requestedProviderVersion = evalSessionProviderVersion(request);
-  const runtimeContext = await prepareEvalRuntimeContext(
-    resolve(request.session.workingDirectory ?? process.cwd()),
-  );
-  const service = options.serviceFactory?.(runnerdPath) ??
-    new CapabilityLiveSessionService({
-      transportOptions: {
-        ...evalProviderTransportOptions(requestedProvider, request.limits.turnTimeoutMs, request.session.workingDirectory),
-        runnerBinary: runnerdPath,
-        ...(cli.candidateProfile === undefined ? {} : { acpxCandidateProfile: cli.candidateProfile }),
-        runtimeContext,
-        baseInstructions: evalRuntimeSystemInstructions(runtimeContext),
-        // The transport performs the provider-specific allowlisting. Supplying
-        // the source environment here is still required: without it the
-        // isolated Codex home has no credential source and runnerd receives no
-        // executable PATH from the Evalbook CLI process.
-        environment: process.env,
-        onDiagnostic: (message) => {
-          process.stderr.write(`[eval-session runnerd] ${message}\n`);
-        },
-      },
-    });
+  const gateway = cli.gatewayConfigPath
+    ? await prepareEvalGatewayRuntime(cli.gatewayConfigPath, request)
+    : undefined;
   let session: CapabilityLiveSession | null = null;
   let turn: CapabilityLiveTurnResult | null = null;
   let snapshot: CapabilityLiveSessionSnapshot | null = null;
 
   try {
+    const runtimeContext = await prepareEvalRuntimeContext(
+      resolve(request.session.workingDirectory ?? process.cwd()),
+    );
+    const transportOptions: NonNullable<CapabilityLiveSessionServiceOptions["transportOptions"]> = {
+      ...evalProviderTransportOptions(requestedProvider, request.limits.turnTimeoutMs, request.session.workingDirectory),
+      runnerBinary: runnerdPath,
+      ...(cli.candidateProfile === undefined ? {} : { acpxCandidateProfile: cli.candidateProfile }),
+      runtimeContext,
+      baseInstructions: evalRuntimeSystemInstructions(runtimeContext),
+      environment: process.env,
+      ...gateway?.transportOptions,
+      onDiagnostic: (message) => {
+        process.stderr.write(`[eval-session runnerd] ${message}\n`);
+      },
+    };
+    const service = options.serviceFactory?.(runnerdPath, transportOptions)
+      ?? new CapabilityLiveSessionService({ transportOptions });
     // PR3 expands this same service input with the two qualified remote
     // profiles. The cast keeps this isolated PR typecheckable before PR3 lands;
     // the runtime fields and their fail-closed validation are already present.
@@ -470,6 +474,7 @@ export async function runEvalSessionCli(
       build: PAPERCLIP_RUNNER_BUILD_METADATA,
       runnerd: { path: "[withheld]", sha256: `sha256:${actualDigest}` },
       requestedModel: request.model,
+      ...(gateway ? { requestRouting: gateway.evidence } : {}),
       ...(cli.candidateProfile === undefined ? {} : { diagnosticCandidateProfile: cli.candidateProfile }),
       provider: requestedProvider,
       driver: requestedDriver,
@@ -549,6 +554,7 @@ export async function runEvalSessionCli(
       build: PAPERCLIP_RUNNER_BUILD_METADATA,
       runnerd: { path: "[withheld]", sha256: `sha256:${actualDigest}` },
       requestedModel: request.model,
+      ...(gateway ? { requestRouting: gateway.evidence } : {}),
       ...(cli.candidateProfile === undefined ? {} : { diagnosticCandidateProfile: cli.candidateProfile }),
       provider: requestedProvider,
       driver: requestedDriver,
@@ -575,6 +581,8 @@ export async function runEvalSessionCli(
       },
     }, null, 2)}\n`);
     return 2;
+  } finally {
+    await gateway?.close();
   }
 }
 

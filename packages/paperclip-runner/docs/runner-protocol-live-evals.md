@@ -104,6 +104,61 @@ Claude Managed uses its Agent version, while AgentCore uses its qualification
 revision. Transport API or beta versions remain separate protocol metadata and
 must not replace that runtime identity in a report.
 
+## Controller-assigned gateway route
+
+The Runner eval CLI accepts `--gateway-config /absolute/path/gateway.json` for
+native Codex and ACPX Claude. This is an explicit route for a controller
+that owns a local budget proxy. Normal invocations keep the direct path.
+ACPX Codex is rejected before service creation because its runtime prohibits
+preconfigured homes to protect Runner state.
+The descriptor must bind the exact model and attempt ID from `request.json`:
+
+```json
+{
+  "schema": "paperclip.runner-eval.gateway/v1",
+  "provider": "openai",
+  "model": "gpt-5.4-mini",
+  "baseUrl": "http://127.0.0.1:4567",
+  "campaignId": "campaign-id",
+  "executionId": "cell-id",
+  "attemptId": "attempt-id",
+  "upstreamRoute": "direct"
+}
+```
+
+Use `anthropic` for ACPX Claude. `upstreamRoute` is the controller's declaration:
+`direct` or `braintrust`. It is not an independent verification of the upstream.
+The base URL must be the proxy's explicit IPv4 loopback address and port, with
+no path, query, fragment, or embedded credential. The controller supplies its
+32-byte hexadecimal token through `PAPERCLIP_RUNNER_EVAL_GATEWAY_TOKEN`.
+Do not put provider or Braintrust credentials in this child environment or file.
+
+```sh
+node /path/to/runner/dist/cli/eval-session.js \
+  --request /path/to/request.json --output /path/to/artifact.json \
+  --gateway-config /path/to/gateway.json
+```
+
+The CLI validates the descriptor before creating a provider service. It creates
+an owned temporary home, pins Codex's Responses endpoint or Claude's Messages
+endpoint and exact model, and passes only the assigned proxy credential.
+It does not copy ambient provider keys, subscription logins, proxy settings,
+startup hooks, or user homes into this route. Unsupported harnesses and
+mismatched descriptor identities fail before provider creation. The temporary
+home is removed on success and failure.
+
+Success and failure artifacts retain `requestRouting`: controller gateway mode,
+provider, declared upstream route, campaign/execution/attempt IDs, and the
+SHA-256 of the descriptor bytes. The token and endpoint are excluded from this
+metadata. Existing artifact usage and provider outcomes remain authoritative
+for their respective fields; the route declaration is not a billing receipt.
+The controller must retain its request ledger and link these identities to it.
+
+This entry point does not itself allocate a campaign budget, run the proxy, or
+change the hosted matrix. The controller must enforce request admission,
+deadlines, and limits before forwarding traffic. A local fake-API probe only
+proves routing; it does not qualify live provider or Braintrust behavior.
+
 ## Hosted campaign
 
 Use the `Runner Direct Live Protocol Evals` workflow. Dispatch the workflow

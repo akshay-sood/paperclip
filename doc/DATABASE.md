@@ -49,6 +49,13 @@ and leaves all existing cases passive. Source identities are not grants.
 
 ### Task query performance
 
+Recovery's latest-run queries return the context fields used by recovery
+decisions. Prompts, execution continuation bodies, and workspace setup payloads
+remain in the stored run and its full detail reads. These queries also return
+the PostgreSQL row version. Native blocked-wait repair compares that version
+against a fresh full source read before applying changes. Any intervening row
+update, including an edit outside the projection, defers repair to a fresh sweep.
+
 Run-context lookups use expression indexes for both `context_snapshot.issueId`
 and `context_snapshot.paperclipIssue.id`. Task creation provenance has its own
 company-scoped expression index that follows the query's native issue ID and
@@ -97,7 +104,14 @@ The initial agent JWT run lookup reads only the cancellation state and
 conversation flag from saved run JSON. It does not transfer the full context or
 result. Run status, responsible-user identity, company and agent boundaries,
 and the cancellation response remain unchanged. Later identity refreshes keep
-their existing transaction and data reads.
+their current authorization and transaction boundaries.
+
+Chat recovery ancestry selects task identifiers and source-run links instead
+of full execution payloads. Instruction authorization selects current identity
+fields and still rechecks accepted identity, key revocation, and membership.
+Identity task locks and activation receipts project typed legacy task keys with
+the native and first-class issue IDs. These projections preserve task binding
+precedence and validation without transferring prompts or output.
 
 To measure authentication query responses on disposable synthetic data:
 

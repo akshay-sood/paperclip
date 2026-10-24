@@ -1,3 +1,4 @@
+import { recoveryRunContextColumn, recoveryRunVersionColumn } from "./run-context-read.js";
 import { isAgentAwaitingSetup } from "../../modules/agent-lifecycle/index.js";
 import { onboardingFirstTaskAwaitingUserSql } from "./onboarding-first-task-wait.js";
 import { isAiAuthenticationBlocked } from "../ai-auth-failure.js";
@@ -25,6 +26,7 @@ import {
   desc,
   eq,
   gt,
+  getTableColumns,
   gte,
   inArray,
   isNotNull,
@@ -247,6 +249,7 @@ type LatestIssueRun =
       | "createdAt"
     > & {
       resultJson?: unknown;
+      rowVersion?: string;
     })
   | null;
 type SuccessfulLatestIssueRun = NonNullable<LatestIssueRun> & {
@@ -977,7 +980,8 @@ export function recoveryService(
         status: heartbeatRuns.status,
         error: heartbeatRuns.error,
         errorCode: heartbeatRuns.errorCode,
-        contextSnapshot: heartbeatRuns.contextSnapshot,
+        contextSnapshot: recoveryRunContextColumn,
+        rowVersion: recoveryRunVersionColumn,
         livenessState: heartbeatRuns.livenessState,
         resultJson: heartbeatRuns.resultJson,
         startedAt: heartbeatRuns.startedAt,
@@ -1007,7 +1011,8 @@ export function recoveryService(
         status: heartbeatRuns.status,
         error: heartbeatRuns.error,
         errorCode: heartbeatRuns.errorCode,
-        contextSnapshot: heartbeatRuns.contextSnapshot,
+        contextSnapshot: recoveryRunContextColumn,
+        rowVersion: recoveryRunVersionColumn,
         livenessState: heartbeatRuns.livenessState,
         resultJson: heartbeatRuns.resultJson,
         startedAt: heartbeatRuns.startedAt,
@@ -1618,7 +1623,10 @@ export function recoveryService(
         return false;
 
       const source = await tx
-        .select()
+        .select({
+          ...getTableColumns(heartbeatRuns),
+          rowVersion: recoveryRunVersionColumn,
+        })
         .from(heartbeatRuns)
         .where(
           and(
@@ -1634,8 +1642,9 @@ export function recoveryService(
         source.id !== latestRun.id ||
         source.agentId !== current.assigneeAgentId ||
         source.status !== "succeeded" ||
-        JSON.stringify(source.contextSnapshot) !==
-          JSON.stringify(latestRun.contextSnapshot)
+        (latestRun.rowVersion !== undefined
+          ? source.rowVersion !== latestRun.rowVersion
+          : JSON.stringify(source.contextSnapshot) !== JSON.stringify(latestRun.contextSnapshot))
       )
         return false;
       const proof = await nativeBlockedUnblockAction(
@@ -1903,7 +1912,8 @@ export function recoveryService(
         status: heartbeatRuns.status,
         error: heartbeatRuns.error,
         errorCode: heartbeatRuns.errorCode,
-        contextSnapshot: heartbeatRuns.contextSnapshot,
+        contextSnapshot: recoveryRunContextColumn,
+        rowVersion: recoveryRunVersionColumn,
         livenessState: heartbeatRuns.livenessState,
         resultJson: heartbeatRuns.resultJson,
         startedAt: heartbeatRuns.startedAt,
