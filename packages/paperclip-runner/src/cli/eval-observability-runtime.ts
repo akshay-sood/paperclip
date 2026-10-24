@@ -22,7 +22,7 @@ function text(value: unknown): string {
   return value;
 }
 function decodedMap(value: unknown): Record<string, string> {
-  const result: Record<string, string> = {};
+  const result: Record<string, string> = Object.create(null);
   for (const item of text(value).split(",")) {
     const index = item.indexOf("=");
     if (index < 1) throw invalid();

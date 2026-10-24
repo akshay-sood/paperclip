@@ -91,12 +91,13 @@ it.each([["codex", undefined], ["acpx", "claude"]])("applies the existing %s/%s 
   } finally { await gateway.close(); }
 });
 
-it.each(["identity", "endpoint", "parent", "credential", "company", "rawBodies", "modelEnvironment", "extraField", "unknownExporter"])("rejects observability %s drift before changing the gateway home", async fault => {
+it.each(["identity", "endpoint", "parent", "credential", "company", "rawBodies", "modelEnvironment", "extraField", "unknownExporter", "prototypeHeader"])("rejects observability %s drift before changing the gateway home", async fault => {
   const f = await fixture(), observation = await observabilityFixture(f);
   const descriptor = observation.descriptor as unknown as Record<string, any>;
   if (fault === "identity") descriptor.attemptId = "other";
   if (fault === "endpoint") descriptor.launch.otelConfig.exporter["otlp-http"].endpoint = "https://api.braintrust.dev/otel/v1/logs";
   if (fault === "parent") descriptor.traceId = "3".repeat(32);
+  if (fault === "prototypeHeader") descriptor.launch.environment.OTEL_EXPORTER_OTLP_LOGS_HEADERS += ",__proto__=ignored";
   if (fault === "credential") descriptor.launch.environment.OTEL_EXPORTER_OTLP_LOGS_HEADERS += ",authorization=Bearer%20upstream-secret";
   if (fault === "company") descriptor.launch.otelConfig.span_attributes["paperclip.company.id"] = "other";
   if (fault === "rawBodies") descriptor.launch.otelConfig.log_guardian_assessments = true;
