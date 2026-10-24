@@ -59,7 +59,7 @@ None is deployed. The remaining acceptance gates below are not waived.
 
 | Layer | Latest evidence | Limit / next gate |
 | --- | --- | --- |
-| Runner | Initial split: 191 controller/profile, 96 Rust, 11 parity tests and three one-process fixture cases passed. After refresh onto master, protocol manifest/schema/replay and dependency-boundary checks pass. `2d72e827c991feb0f88d178aaf1ad1e0628f3e83` has Greptile 5/5 and passing unit, Rust, typecheck and build lanes. | A browser shard hit a lock timeout while cancelling a legacy fixture run; one scoped rerun is pending. Synthetic execution does not qualify Codex/Claude. |
+| Runner | Initial split: 191 controller/profile, 96 Rust, 11 parity tests and three one-process fixture cases passed. After refresh onto master, protocol manifest/schema/replay and dependency-boundary checks pass. `2d72e827c991feb0f88d178aaf1ad1e0628f3e83` has Greptile 5/5 and passing unit, Rust, typecheck and build lanes. | The scoped rerun passed after an earlier browser fixture cancellation hit a lock timeout; CI is green for this revision. Synthetic execution does not qualify Codex/Claude. |
 | Server | Refreshed recovery, renewal and plugin-adoption suites: 43 passed, five optional profiles skipped. The subsequent liveness-pool fix passed all 822 native executor/renewal tests with real Postgres. Saturated application-pool, cancelled row-lock wait, expiry-during-lock and natural 60-second claim-lifetime regressions passed. | Final CI/review on the renewal fix remains required. An unchanged cleanup-page test failed one earlier CI shard. Hosted admission/continuity remains outstanding. |
 | Qualification | 49 focused tests passed, including the real-Postgres observer query. Completion-during-outage review fix: all 32 boundary tests and qualification typecheck pass. Short and full 300-second immutable A→B→A startup smokes passed, with zero agent turns. | The embedded database lifecycle test cannot initialize on this macOS host; hosted Linux verification is running. Active A/B/A, real migration change, natural stale-owner partition, representative concurrent admission and hosted proof remain outstanding. |
 | Transcript delivery | `d0ece7bd2dcaed7f27fc6dea76b788bfd39dfe58`: CI green and Greptile 5/5; 37 focused review/delivery tests pass. Native and legacy two-view browser journeys pass, including zero recurring reads during settled streaming, company switching, socket reconnect, terminal catch-up and reload. | Recheck the final restacked candidate. Deterministic browser dependencies are not live-harness evidence. |
@@ -418,3 +418,26 @@ can retry within the original deadline, but a lost or late response cannot
 restore expired authority. This adds active-run SQL around renewal; it does not
 change the zero-per-text-checkpoint-write or idle-SQL gates. The text-chunk cost
 measurement above excludes periodic renewal overhead.
+
+### Restacked candidate and hands-on browser evidence (2026-10-24)
+
+Candidate `54fc7c6494470a9d553ef7bce7d57b3f5a57d7ba` passed full workspace
+typecheck and build, 80 focused qualification tests, and the separately executed
+real-Postgres recovery observer. This includes server renewal fix
+`57278aa4aa11e3106d645615632571a33764eff5` and qualification fixes through
+`29606367add9d6bc0fbc5ae86f8b41ac9392cb61`. Final-head CI remains the PR gate;
+these local results do not replace it.
+
+A hands-on in-app-browser journey used that candidate, the real runner, the
+deterministic Codex app-server and a disposable Docker database. Starting at the
+dashboard, the operator created TRA-1 through New Task, opened it from Recent
+Tasks, observed live commentary, navigated to Tasks while it was running, returned
+to its completed answer and reloaded it. The result and source link remained
+visible. API inspection confirmed one successful run
+`09cff1ec-5340-48e4-97f0-12334052e4aa` and one final business comment.
+
+Functional outcome: passed. The observed desktop experience was usable, with no
+error banner, duplicate result or lost output. A normal loading skeleton appeared
+on navigation; an unrelated announcement overlay was dismissed. The screenshots
+do not establish smoothness between every sampled frame. No mobile or live-model
+claim is made. Final screenshot: `/tmp/paperclip-transcript-manual-completed-20261024.jpg`.
