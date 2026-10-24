@@ -74,8 +74,6 @@ const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_r
 type HeartbeatRunRow = typeof heartbeatRuns.$inferSelect;
 type IssueRow = typeof issues.$inferSelect;
 
-// Release consumes stop, retry, and workspace evidence, never output text.
-// Keep every other result key and the complete stored result unchanged.
 const releaseRunFields = {
   ...getTableColumns(heartbeatRuns),
   resultJson: sql<Record<string, unknown> | null>`case

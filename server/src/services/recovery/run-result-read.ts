@@ -7,9 +7,6 @@ const recoveryResultKeys = [
   "providerQuotaRetryNotBefore", "finalizationReasonCode",
 ] as const;
 
-/** These three classifiers inspect arbitrary provider error text. Other
- * recovery decisions consume the structured fields below, not model output.
- * Keep the full stored result and all execution/detail reads unchanged. */
 export const recoveryRunResultColumn = sql<Record<string, unknown> | null>`
   case
     when ${heartbeatRuns.resultJson} is null then null
