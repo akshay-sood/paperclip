@@ -12,12 +12,14 @@ import { notifyGitRestorePointWork } from "./git-restore-point-ledger.js";
 import { abandonGitRestorePoint, activateGitRestorePoints, readRestorePointObject, storeSealedRestorePoint } from "./git-restore-point-storage.js";
 import { allocatedBytes, describeGitExpirationFailure, expirationScope, isGitWorkspaceExpirationEligible, type GitExpirationFailure } from "./git-workspace-expiration.js";
 import { IsolatedRepositorySourceBusy, withIsolatedRepositorySourceLock } from "./isolated-remote-workspace-source.js";
+import { logActivity } from "./activity-log.js";
 import {
   captureTaskDirectorySnapshot,
   inspectTaskDirectory,
   materializeTaskDirectorySnapshot,
   newestTaskDirectoryMtime,
   removeTaskDirectoryTree,
+  shortSiblingName,
   TASK_DIRECTORY_RETENTION_KEY,
   TaskDirectoryRestoreFailure,
   TaskDirectorySnapshotSkip,
@@ -36,7 +38,7 @@ const NAMESPACE = "git-restore-points";
 const MAX_RESTORE_POINT_BYTES = 512 * 1024 * 1024;
 const IDENTITY = /^[a-zA-Z0-9_-]+$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const TRASH = /^\.(expired|restoring)-task-directory-/;
+const TRASH = /^\.(expired|restoring)-[0-9a-f]{8,}$/;
 const RETRYABLE_SKIPS = new Set(["source_busy", "lifecycle_busy", "workspace_changed", "live_or_unresolved_consumer",
   "task_directory_changed", "inspection_failed"]);
 
@@ -226,7 +228,7 @@ export async function expireIsolatedTaskDirectory(db: Db, snapshot: Workspace, o
           pending = stored.ledgerId;
           result.restorePoint = true;
           state = { schema: TASK_DIRECTORY_RETENTION_SCHEMA, generation, removed: false,
-            trash: path.join(path.dirname(cwd), `.expired-task-directory-${workspace.id}-${generation}`), restorePoint: stored.ref };
+            trash: shortSiblingName(cwd, ".expired-"), restorePoint: stored.ref };
           if (await exists(state.trash)) throw new Error("unknown_task_directory_trash");
           const metadata = { ...workspace.metadata, lifecycleGeneration: generation, [TASK_DIRECTORY_RETENTION_KEY]: state };
           const archive = closed ? { metadata, updatedAt: options.now } : { status: "archived", closedAt: options.now,
@@ -237,6 +239,17 @@ export async function expireIsolatedTaskDirectory(db: Db, snapshot: Workspace, o
             return rows;
           });
           pending = null;
+          if (!closed) {
+            await logActivity(db, {
+              companyId: workspace!.companyId,
+              actorType: "system",
+              actorId: "workspace_terminality_reaper",
+              action: "execution_workspace.task_directory_archived",
+              entityType: "execution_workspace",
+              entityId: workspace!.id,
+              details: { sourceIssueId: workspace!.sourceIssueId, restorePointId: stored.ref.id, cleanupReason: TASK_DIRECTORY_RETENTION_REASON },
+            });
+          }
         } else {
           result.candidate = true;
           if (present) result.candidateBytes = await allocatedBytes(cwd, () => { options.signal?.throwIfAborted(); return true; });
@@ -274,9 +287,23 @@ export async function expireIsolatedTaskDirectory(db: Db, snapshot: Workspace, o
           await removeTaskDirectoryTree(state.trash);
           result.reclaimedBytes = bytes;
         }
-        state = { ...state, removed: true, removedAt: new Date().toISOString() };
-        await db.update(executionWorkspaces).set({ metadata: { ...workspace.metadata, [TASK_DIRECTORY_RETENTION_KEY]: state }, updatedAt: new Date() })
-          .where(eq(executionWorkspaces.id, workspace.id));
+        const removedAt = new Date().toISOString();
+        await db.update(executionWorkspaces).set({
+          metadata: sql`jsonb_set(jsonb_set(${executionWorkspaces.metadata}, ${`{${TASK_DIRECTORY_RETENTION_KEY},removed}`}::text[], 'true'::jsonb),
+            ${`{${TASK_DIRECTORY_RETENTION_KEY},removedAt}`}::text[], ${JSON.stringify(removedAt)}::jsonb)`,
+          updatedAt: new Date(),
+        }).where(and(eq(executionWorkspaces.id, workspace.id),
+          sql`${executionWorkspaces.metadata}->${TASK_DIRECTORY_RETENTION_KEY}->'restorePoint'->>'objectKey' = ${state.restorePoint.objectKey}`));
+        await logActivity(db, {
+          companyId: workspace.companyId,
+          actorType: "system",
+          actorId: "workspace_terminality_reaper",
+          action: "execution_workspace.task_directory_removed",
+          entityType: "execution_workspace",
+          entityId: workspace.id,
+          details: { sourceIssueId: workspace.sourceIssueId, restorePointId: state.restorePoint.id, reclaimedBytes: result.reclaimedBytes,
+            cleanupReason: TASK_DIRECTORY_RETENTION_REASON },
+        });
         result.expired = true;
         return result;
       })), true);
@@ -334,7 +361,7 @@ export async function restoreIsolatedTaskDirectory(input: {
   if (ciphertext.length !== ref.byteSize) throw new TaskDirectoryRestoreFailure("ciphertext_size_mismatch");
   const payload = await openRestorePoint({ ciphertext, sha256: ref.sha256, key: ref.key,
     identity: { companyId: input.workspace.companyId, workspaceId: input.workspace.id, restorePointId: ref.id, generation: ref.generation } });
-  const staging = await materializeTaskDirectorySnapshot({ payload, parent, expectedDigest: ref.digest, signal: input.signal });
+  const staging = await materializeTaskDirectorySnapshot({ payload, target: cwd, expectedDigest: ref.digest, signal: input.signal });
   try {
     await fs.rename(staging, cwd);
   } catch (error) {
@@ -353,6 +380,7 @@ export type TaskDirectoryFolderResult = {
   reclaimedBytes: number;
   executionWorkspaceId?: string;
   retryAt?: number;
+  walkRetryAt?: number;
   failure?: GitExpirationFailure;
 };
 
@@ -495,9 +523,12 @@ async function inspectTaskDirectoryFolder(db: Db, companyId: string, name: strin
         result.outcome = "dry_run";
         return;
       }
-      const trash = path.join(companyDir, `.expired-task-directory-orphan-${name}-${randomUUID()}`);
+      const trash = shortSiblingName(folder, ".expired-");
       await fs.rename(folder, trash);
-      await removeTaskDirectoryTree(trash);
+      await removeTaskDirectoryTree(trash).catch(() => {
+        result.walkRetryAt = nowMs + TASK_DIRECTORY_RETRY_MS;
+        throw new Error("task_directory_trash_pending");
+      });
       result.outcome = "removed";
       result.reclaimedBytes = result.candidateBytes;
     }, true);

@@ -272,21 +272,25 @@ per-restore-point key wrapped by the instance secrets key, uploaded to file stor
 `git-restore-points/<workspace>/<generation>/task-directory/`, read back and hash-checked,
 and activated in the same transaction that archives the workspace and records the
 `isolatedTaskDirectoryRetention` state in its metadata. It follows the git restore point
-retention (`PAPERCLIP_GIT_RESTORE_POINT_RETENTION_DAYS`, default `90`, after the tree
-closes). Restore points must be enabled (`PAPERCLIP_GIT_RESTORE_POINTS_ENABLED=true`,
+retention (`PAPERCLIP_GIT_RESTORE_POINT_RETENTION_DAYS`, default `90`), counted from the
+later of the tree's close and the removal, so a task that closed long ago still keeps its
+files for the full period. Restore points must be enabled (`PAPERCLIP_GIT_RESTORE_POINTS_ENABLED=true`,
 `restore_points_disabled` otherwise), and they are refused when the file storage is `s3`
 and the secrets master key does not come from `PAPERCLIP_SECRETS_MASTER_KEY`.
 
 Right before deletion the directory is read again. If anything changed since the capture,
 the workspace is made active again, the restore point is dropped and the directory stays
-(`task_directory_changed`). Otherwise the directory is renamed to
-`.expired-task-directory-<workspace>-<generation>` beside it and deleted. A removal the
+(`task_directory_changed`). Otherwise the directory is renamed to a recorded
+`.expired-<random>` name beside it, no longer than the original name, and deleted. The
+archive and the removal are recorded as `execution_workspace.task_directory_archived` and
+`execution_workspace.task_directory_removed` activity. A removal the
 server could not finish is finished by a later sweep.
 
 Reopening the workspace restores the directory before anything uses it: a comment or an
 agent update on an issue bound to a closed `isolated_workspace`, or the next run of the
-issue in either mode. The files are written to a staging directory, verified against the
-saved digest and renamed into place. An empty directory in the way is replaced; a non-empty
+issue in either mode. The files are written to a `.restoring-<random>` staging directory
+beside it, whose name is no longer than the original, verified against the saved digest
+and renamed into place. An empty directory in the way is replaced; a non-empty
 one that does not match keeps the workspace closed and fails the reopen instead of
 overwriting it. After a successful reopen the restore point is superseded and removed; the
 next retention saves a new one. When the restore point has already expired, the reopen
@@ -322,8 +326,9 @@ ancestors, whose trees may have just closed. A directory it kept is checked
 again at its own deadline: the end of the grace period or terminal delay, or an hour later
 when a lock was busy or a live run, lease, service, finalization or recovery action still
 used it. A directory whose issue is open waits for the issue to close. With nothing pending
-it registers no work. The walk also deletes leftover `.expired-task-directory-*` and
-`.restoring-task-directory-*` directories older than an hour.
+it registers no work. The walk also deletes leftover `.expired-*` and `.restoring-*`
+directories older than an hour; when deleting an orphan's trash fails, another walk is
+scheduled an hour later.
 
 ### Controls and logs
 

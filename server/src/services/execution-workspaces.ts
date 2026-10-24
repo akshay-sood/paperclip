@@ -1835,6 +1835,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     }
     for (const folder of results) {
       const key = `${folder.companyId}/${folder.issueId}`;
+      if (folder.walkRetryAt !== undefined) taskDirectoryWalkDueAt = Math.min(taskDirectoryWalkDueAt, folder.walkRetryAt);
       if (folder.retryAt !== undefined) rememberFolder(key, folder.retryAt);
       else taskDirectoryFolderDue.delete(key);
       logger.info({ event: "execution_workspace.task_directory_cleanup", dryRun: settings.dryRun, ...folder }, "Isolated task directory inspected");

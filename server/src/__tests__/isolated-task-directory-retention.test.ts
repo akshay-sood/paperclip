@@ -6,6 +6,7 @@ import { execFileSync } from "node:child_process";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { eq, sql } from "drizzle-orm";
 import {
+  activityLog,
   agents,
   companies,
   createDb,
@@ -29,6 +30,7 @@ import {
   TASK_DIRECTORY_RESTORE_POINT_EXPIRED_WARNING,
 } from "../services/isolated-task-directory-retention.js";
 import { markGitRestorePointExpired } from "../services/git-restore-point-storage.js";
+import { gitRestorePointRetentionService } from "../services/git-restore-point-ledger.js";
 import { getStorageService } from "../storage/index.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -306,6 +308,41 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
     expect(await f.expire()).toMatchObject({ expired: true });
     expect(await f.reopen()).toMatchObject({ ok: true, reopened: true });
     expect(await fs.readFile(path.join(f.cwd, "report\\final.txt"), "utf8")).toBe("backslash name\n");
+  });
+
+  it("restores a deep path that fills the platform path length", async () => {
+    const f = await fixture();
+    let deep = f.cwd;
+    while (deep.length < 1000) deep = path.join(deep, "d".repeat(Math.min(60, 1000 - deep.length)));
+    await fs.mkdir(deep, { recursive: true });
+    const file = path.join(deep, "z".repeat(Math.max(1, 1015 - deep.length)));
+    await fs.writeFile(file, "deep\n");
+    expect(await f.expire()).toMatchObject({ expired: true });
+    expect(await f.reopen()).toMatchObject({ ok: true, reopened: true });
+    expect(await fs.readFile(file, "utf8")).toBe("deep\n");
+  });
+
+  it("keeps an expiry recorded while the directory was being removed, and records activity", async () => {
+    const f = await fixture();
+    const result = await f.expire({ beforeDelete: async () => {
+      const [ledger] = await f.ledger();
+      await markGitRestorePointExpired(db, ledger!);
+    } });
+    expect(result).toMatchObject({ expired: true });
+    expect(readTaskDirectoryRetention(await f.row())).toMatchObject({ removed: true, restorePoint: { expiredAt: expect.any(String) } });
+    const actions = await db.select({ action: activityLog.action }).from(activityLog).where(eq(activityLog.entityId, f.workspaceId));
+    expect(actions.map(row => row.action).sort()).toEqual(["execution_workspace.task_directory_archived", "execution_workspace.task_directory_removed"]);
+  });
+
+  it("keeps a new restore point for the full retention even when the task closed long ago", async () => {
+    const f = await fixture({ closedDaysAgo: 120 });
+    expect(await f.expire()).toMatchObject({ expired: true });
+    const retention = gitRestorePointRetentionService(db, { storage: getStorageService(), retentionDays: 90 });
+    await retention.tick();
+    expect(await f.ledger()).toMatchObject([{ status: "active" }]);
+    expect(readTaskDirectoryRetention(await f.row())?.restorePoint.expiredAt).toBeUndefined();
+    expect(await f.reopen()).toMatchObject({ ok: true, reopened: true });
+    await expectRestored(f.cwd);
   });
 
   it("does not let skipped rows starve later rows of the per-sweep budget", async () => {

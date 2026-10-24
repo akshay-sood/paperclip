@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { DEFAULT_RESTORE_POINT_LIMITS } from "./git-restore-point.js";
@@ -206,10 +206,15 @@ export function decodeTaskDirectorySnapshot(payload: Buffer): { manifest: TaskDi
   return { manifest, bodies };
 }
 
-export async function materializeTaskDirectorySnapshot(input: { payload: Buffer; parent: string; expectedDigest: string; signal?: AbortSignal }) {
+export function shortSiblingName(target: string, prefix: string) {
+  const length = Math.max(8, path.basename(target).length - prefix.length);
+  return path.join(path.dirname(target), `${prefix}${randomBytes(Math.ceil(length / 2)).toString("hex").slice(0, length)}`);
+}
+
+export async function materializeTaskDirectorySnapshot(input: { payload: Buffer; target: string; expectedDigest: string; signal?: AbortSignal }) {
   const { manifest, bodies } = decodeTaskDirectorySnapshot(input.payload);
   if (taskDirectoryManifestDigest(manifest) !== input.expectedDigest) throw new TaskDirectoryRestoreFailure("snapshot_digest_mismatch");
-  const staging = path.join(input.parent, `.restoring-task-directory-${randomUUID()}`);
+  const staging = shortSiblingName(input.target, ".restoring-");
   await fs.mkdir(staging, { mode: 0o700 });
   try {
     let offset = 0;
