@@ -1,6 +1,7 @@
 import { pendingCleanupDeadlineSql } from "../environment-cleanup-state.js";
 import { writeEnvironmentCleanup } from "../environment-cleanup-notifications.js";
 import type { WorkspaceWorkers } from "../plugin-workspaces.js";
+import { listExpiredNativeRunnerAuthorities } from "../native-runtime/native-runner-checkpoint.js";
 import { createHeartbeatAgentStatus } from "./agent-status.js";
 import { preserveWorkspaceRestoreRecoveryMetadataSql } from "../legacy-workspace-restore-recovery.js";
 import { preserveCancelledNativeWorkspaces } from "../native-runtime/native-failed-workspace-recovery.js";
@@ -905,18 +906,17 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     };
   }
 
-  async function recoverNativeRunsAfterRestart(now = new Date()) {
-    await reconcileRetainedWorkspaces(db, environmentRuntime, resumeRemoteStopComments);
-    // A result committed before the old controller stopped outranks process
-    // recovery. Finish its durable workspace/status suffix before deciding
-    // whether any provider authority needs to be reopened.
-    await reconcileNativeFinalizations(db, undefined, {
-      environmentRuntime,
-      pluginWorkerManager: dependencies.pluginWorkerManager,
-      onWorkspaceSettled: settleRecoveredNativeWorkspace,
-    });
-    await preserveCancelledNativeWorkspaces(db);
-    scheduleRetainedNativeSessionCleanup();
+  async function recoverNativeRunsAfterRestart(now = new Date(), runIds?: string[]) {
+    if (!runIds) {
+      await reconcileRetainedWorkspaces(db, environmentRuntime, resumeRemoteStopComments);
+      await reconcileNativeFinalizations(db, undefined, {
+        environmentRuntime,
+        pluginWorkerManager: dependencies.pluginWorkerManager,
+        onWorkspaceSettled: settleRecoveredNativeWorkspace,
+      });
+      await preserveCancelledNativeWorkspaces(db);
+      scheduleRetainedNativeSessionCleanup();
+    }
     const intent = await readHotRestartIntent().catch((error) => {
       logger.warn(
         { err: error },
@@ -957,6 +957,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     }
     const dispositions = await claimNativeRestartRecoveries({
       db,
+      runIds,
       restartKind,
       recoveryRequestId: intent?.recoveryRequestId ?? null,
       coordinatedPreviousController: intent
@@ -1089,6 +1090,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     const interruptedRunIds: string[] = [];
     const retryRunIds: string[] = [];
     const restartSuspendedRunIds: string[] = [];
+    const nativeController = await currentNativeControllerIdentity();
 
     const settlementDeadline = new Date(Date.now() + 30_000);
     const settlements = await Promise.allSettled(activeRuns.map(async ({ run, agent }) => {
@@ -1101,6 +1103,9 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         run.runtimeMode === "native" &&
         agent.adapterType === "paperclip_runner"
       ) {
+        const [owner] = await db.select({ bootId: nativeRunFinalizations.controllerBootId })
+          .from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, run.id));
+        if (owner?.bootId && owner.bootId !== nativeController.bootId) return;
         // A graceful shutdown relinquishes controller authority just like a
         // hot restart. Leaving the old event consumer attached lets its
         // finalizer interrupt/suspend Claude while the next server is adopting
@@ -1117,6 +1122,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         await db
           .update(nativeRunFinalizations)
           .set({
+            leaseExpiresAt: now,
             recoveryState: "awaiting_runner_reattach",
             recoveryHistory: sql`(
               select coalesce(jsonb_agg(item order by ordinal), '[]'::jsonb)
@@ -1137,6 +1143,8 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
           .where(
             and(
               eq(nativeRunFinalizations.runId, run.id),
+              owner?.bootId ? eq(nativeRunFinalizations.controllerBootId, owner.bootId)
+                : isNull(nativeRunFinalizations.controllerBootId),
               isNull(nativeRunFinalizations.resultId),
             ),
           );
@@ -2175,6 +2183,20 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       )
       .where(eq(heartbeatRuns.status, "running"));
 
+    // Reuse the orphan sweep's active-run inventory. Only an expired, untracked
+    // controller creates recovery work; idle sweeps add no checkpoint query.
+    const expiredNativeRunIds = activeRuns.filter(({ run, nativeCoordinatorPhase, nativeControllerLeaseExpiresAt }) =>
+      run.runtimeMode === "native" && nativeCoordinatorPhase === "observed"
+      && (!nativeControllerLeaseExpiresAt || nativeControllerLeaseExpiresAt <= now)
+      && !isNativeRunnerOwnershipHeld(run)
+      && !activeRunExecutions.has(run.id) && !runningProcesses.has(run.id),
+    ).map(({ run }) => run.id);
+    const remoteRecoveryRunIds = new Set(await listExpiredNativeRunnerAuthorities(db, now, expiredNativeRunIds));
+    if (remoteRecoveryRunIds.size) {
+      const recovery = await recoverNativeRunsAfterRestart(now, [...remoteRecoveryRunIds]);
+      for (const claim of recovery.claims) resumedRunIds.add(claim.runId);
+    }
+
     const monitorIssueIds = [
       ...new Set(
         activeRuns.flatMap(({ run }) => {
@@ -2219,6 +2241,9 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       nativeControllerLeaseExpiresAt,
       nativeWorkspaceFinalizationPending,
     } of activeRuns) {
+      // Native recovery owns these dispositions. Its writes happened after this
+      // inventory was read; do not reap or overwrite them using the old row.
+      if (remoteRecoveryRunIds.has(run.id)) continue;
       // Authentication timeout requires an explicit ownership resolution, not
       // repeated reattachment or a process-gone guess on subsequent sweeps.
       if (isNativeRunnerOwnershipHeld(run)) continue;
