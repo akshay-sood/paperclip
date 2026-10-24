@@ -441,3 +441,20 @@ error banner, duplicate result or lost output. A normal loading skeleton appeare
 on navigation; an unrelated announcement overlay was dismissed. The screenshots
 do not establish smoothness between every sampled frame. No mobile or live-model
 claim is made. Final screenshot: `/tmp/paperclip-transcript-manual-completed-20261024.jpg`.
+
+### Native notification catch-up correction (2026-10-24)
+
+Review found that a consecutive native commit notification could be mistaken for
+a complete transcript row. The notification contains no PRP body. Native views
+now request canonical history through its sequence and never merge the empty
+notification over text. The 73 focused hook, projection and sequence tests pass,
+including consecutive notifications, delayed duplicates, a notification racing
+an older read, failed-read recovery and zero recurring reads for complete live
+PRP rows. These tests use the real native transcript projection. Token gates pass.
+Payload-free notifications cause event-driven history reads; this is distinct
+from the zero recurring reads during settled negotiated streaming.
+UI typecheck and the native two-view browser journey also pass after this fix
+(39.1-second journey, 53.4 seconds total). That journey rebuilds the shipped UI,
+uses the real runner with the deterministic Codex app-server, and verifies socket
+reconnect, company changes, terminal catch-up, reload and one final business
+comment. It does not qualify a live provider or hosted upgrade.
