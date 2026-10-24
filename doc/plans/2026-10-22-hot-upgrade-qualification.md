@@ -121,6 +121,44 @@ Workflow changes on this branch cannot replace its required default-branch
 workflow authorization. Hosted continuity remains unqualified until an authorized
 path can build the image and consume the immutable A/B artifacts.
 
+After refreshing the stack onto master, workspace typecheck and all 43 targeted
+recovery, renewal and plugin-adoption tests passed (five optional profiles skipped).
+Master already fixed the stale stylesheet-preload browser fixture; fresh CI is
+running on the refreshed stack. Hosted Linux source verification for qualification
+revision `c7bdc72416c98b6781b11452eba878036a9f862a` is tracked by
+[run 40127795703](https://github.com/paperclipai/paperclip/actions/runs/40127795703).
+
+### Transcript delivery measurements
+
+The fixed workload emits 1,024 events of 2,048 characters in bursts of 16. These
+are measurements of the in-process delivery boundary with simulated sockets.
+They exclude canonical persistence, real network behavior, browser rendering,
+and production capacity. Heap deltas depend on garbage collection.
+
+| Views | Full transcript deliveries | Encoded bytes | Authorization calls | Elapsed ms | CPU ms | Heap delta (bytes) | p95 delivery ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Zero interested views | 0 | 230 | 1 | 2.310 | 3.014 | +1,364,856 | — |
+| One view | 1,024 | 2,259,853 | 1,024 | 8.205 | 18.437 | +2,254,512 | 0.082334 |
+| Three browser connections | 3,072 | 6,779,559 | 3,072 | 12.543 | 12.780 | −2,520,744 | 0.124167 |
+| Congested connection | 464 | 1,023,959 | 465 | 2.954 | 2.903 | −2,499,248 | 0.038083 |
+
+The zero-interest case coalesced one lightweight activity notification. The
+normal one-view peak retained queue was 16 items / 35,344 bytes. The congested
+case requested resynchronization while staying inside the delivery bound.
+Private receipt: `/tmp/paperclip-live-delivery-cost-20261024.json`.
+
+The native Playwright journey passed in 39.5 seconds (50.8 including setup) on
+`267d221f4659ff17d95c99ad5fac5e77f37c8538` plus its test-only transport fault
+injection and document-scoped connection accounting. It used a real runner,
+disposable Docker Postgres, and the deterministic Codex app-server. The run
+`efd7ca4d-7b63-4b02-8312-44bbcad32f91` completed once; both views retained the
+final output through reload and the business comment table contained one final
+comment. There were zero transcript history requests during a settled 2.5-second
+streaming interval, exceeding the fallback's 2-second poll interval. Earlier
+attempts exposed obsolete test selectors, provider-discovery precedence, and
+Chromium's failure to close existing sockets during offline emulation; none was
+recorded as a passing reconnect check.
+
 ## Evidence layers
 
 | Layer | Execution and owner | What it proves | Cadence |
