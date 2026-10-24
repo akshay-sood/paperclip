@@ -49,6 +49,12 @@ and leaves all existing cases passive. Source identities are not grants.
 
 ### Task query performance
 
+The issue-lock adapter's release read omits `result_json.stdout` and
+`result_json.stderr` before transferring a run to the controller. Every other result key, context field, and
+stop, retry, lease, and workspace-recovery check stays intact. Full output remains
+stored for execution history and detail reads. Terminal telemetry loads only its
+run identity, timestamps, usage, and typed task identifier.
+
 Recovery's latest-run queries return the context fields used by recovery
 decisions. Prompts, execution continuation bodies, and workspace setup payloads
 remain in the stored run and its full detail reads. These queries also return
